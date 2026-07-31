@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# codex-switch — 在 Codex 官方订阅(ChatGPT 登录)与 cctq relay(API key)之间切换
+#
+# 用法:
+#   codex-switch status    # 当前模式、auth 类型、历史会话 provider 分布
+#   codex-switch relay     # 切到 www.cctq.ai/v1 中转 (key 需先存入 ~/.codex/cctq.key)
+#   codex-switch official  # 切回 ChatGPT 订阅 (恢复 ~/.codex/auth.official.json)
+#   codex-switch sync      # 只做会话元数据同步(对齐到当前 provider),不切换
+#
+# 设计说明:
+# - 新版 Codex (>=0.145) 禁止覆写内置 provider id "openai",中转必须用独立 id
+#   "cctq"。/resume 按 provider 过滤历史会话,id 一变历史就"消失"(文件没丢)。
+#   因此每次切换后自动做 Dailin521/codex-provider-sync 同款恢复:
+#   把 state_*.sqlite 的 threads.model_provider 和 sessions/ 下各 rollout
+#   jsonl 首行 session_meta 的 model_provider 全部改写为当前 provider id。
+# - 官方登录态在首次切 relay 时备份到 auth.official.json,切回时恢复。
+# - [model_providers.cctq] 配置块一次性写入 config.toml 后不再移除,
+#   切换只改根级 model_provider 一行 + auth.json。
+# - config.toml 每次工具调用都会重读,但 auth 是 codex mcp-server 进程级缓存,
+#   所以切换后要杀掉存量 mcp-server 进程(脚本自动做)。Claude Code 的 codex MCP
+#   注册指向 ~/bin/codex-mcp-keeper(守护包装器):它保持与 Claude Code 的管道,
+#   内层被杀后自动重拉并重放 MCP 握手,因此切换对运行中的会话无感,无需人工
+#   /mcp reconnect;TUI/exec 每次新进程,天然不受影响。
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CFG="$CODEX_HOME/config.toml"
+AUTH="$CODEX_HOME/auth.json"
+BAK="$CODEX_HOME/auth.official.json"
+KEYFILE="$CODEX_HOME/cctq.key"
+RELAY_ID="cctq"
+RELAY_URL="https://www.cctq.ai/v1"
+
+die() { echo "codex-switch: $*" >&2; exit 1; }
+
+current_provider() {
+  sed -n 's/^model_provider *= *"\([^"]*\)".*/\1/p' "$CFG" | head -1
+}
+
+auth_kind() {
+  python3 - "$AUTH" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print("missing"); sys.exit()
+if d.get("tokens"): print("chatgpt")
+elif d.get("OPENAI_API_KEY"): print("apikey")
+else: print("unknown")
+PY
+}
+
+set_provider() {  # $1 = provider id, 改根级 model_provider 一行
+  python3 - "$CFG" "$1" <<'PY'
+import re,sys
+p,pid=sys.argv[1:3]
+src=open(p).read()
+new,n=re.subn(r'(?m)^model_provider *=.*$', f'model_provider = "{pid}"', src, count=1)
+if n==0: new=f'model_provider = "{pid}"\n'+src
+open(p,'w').write(new)
+PY
+}
+
+ensure_relay_block() {  # 幂等写入 [model_providers.cctq]
+  grep -qF "[model_providers.$RELAY_ID]" "$CFG" && return 0
+  python3 - "$CFG" "$RELAY_ID" "$RELAY_URL" <<'PY'
+import re,sys
+p,pid,url=sys.argv[1:4]
+block=f'''# BEGIN CODEX-SWITCH RELAY
+[model_providers.{pid}]
+name = "cctq relay"
+base_url = "{url}"
+wire_api = "responses"
+requires_openai_auth = true
+# END CODEX-SWITCH RELAY
+'''
+src=open(p).read()
+anchor="# END CLAUDE SYNC ROOT\n"
+if anchor in src:
+    src=src.replace(anchor, anchor+"\n"+block, 1)
+else:
+    m=re.search(r'(?m)^\[', src)
+    pos=m.start() if m else len(src)
+    src=src[:pos]+block+"\n"+src[pos:]
+open(p,'w').write(src)
+PY
+}
+
+sync_meta() {  # $1 = provider id: 对齐 sqlite + rollout 元数据 (Dailin521 同款)
+  python3 - "$CODEX_HOME" "$1" <<'PY'
+import glob,json,os,sqlite3,sys
+home,pid=sys.argv[1:3]
+# 1) state_*.sqlite: threads.model_provider
+for db in sorted(glob.glob(os.path.join(home,"state_*.sqlite"))):
+    con=sqlite3.connect(db)
+    try:
+        tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "threads" in tables:
+            cur=con.execute("UPDATE threads SET model_provider=? WHERE model_provider!=?", (pid,pid))
+            con.commit()
+            if cur.rowcount: print(f"  {os.path.basename(db)}: {cur.rowcount} threads -> {pid}")
+    finally:
+        con.close()
+# 2) sessions rollout jsonl 首行 session_meta 的 model_provider
+n=0
+for f in glob.glob(os.path.join(home,"sessions","**","*.jsonl"), recursive=True):
+    with open(f) as fp:
+        first=fp.readline()
+        rest=fp.read()
+    try: d=json.loads(first)
+    except Exception: continue
+    pl=d.get("payload") or {}
+    if d.get("type")=="session_meta" and pl.get("model_provider") not in (None,pid):
+        pl["model_provider"]=pid
+        tmp=f+".tmp"
+        with open(tmp,"w") as fp:
+            fp.write(json.dumps(d,ensure_ascii=False)+"\n"); fp.write(rest)
+        os.replace(tmp,f); n+=1
+if n: print(f"  sessions: {n} rollout files -> {pid}")
+PY
+}
+
+restart_mcp() {  # 杀掉缓存旧 auth 的 mcp-server;codex-mcp-keeper 会自动重拉并保持连接
+  if pkill -f "codex mcp-server" 2>/dev/null; then
+    echo "已终止存量 codex mcp-server 进程(auth 为进程级缓存);keeper 会自动重拉,MCP 连接无感存活"
+    echo "(仅 keeper 注册之前启动的旧 Claude 会话需要手动 /mcp reconnect 一次)"
+  fi
+}
+
+cmd_status() {
+  echo "provider : $(current_provider)"
+  echo "auth     : $(auth_kind)"
+  [ -f "$BAK" ] && echo "官方登录态备份: $BAK (有)" || echo "官方登录态备份: 无"
+  [ -s "$KEYFILE" ] && echo "relay key: $KEYFILE (有, $(wc -c <"$KEYFILE") bytes)" || echo "relay key: 无 ($KEYFILE)"
+  echo "threads provider 分布:"
+  for db in "$CODEX_HOME"/state_*.sqlite; do
+    sqlite3 "$db" "SELECT '  '||model_provider||': '||count(*) FROM threads GROUP BY model_provider;" 2>/dev/null || true
+  done
+}
+
+cmd_relay() {
+  [ -s "$KEYFILE" ] || die "先把 relay token 存入 $KEYFILE (printf '%s' 'sk-xxx' > $KEYFILE && chmod 600 $KEYFILE)"
+  cp "$CFG" "$CFG.bak.codex-switch"
+  if [ "$(auth_kind)" = chatgpt ]; then
+    cp "$AUTH" "$BAK"; echo "已备份官方登录态 -> $BAK"
+  fi
+  python3 - "$AUTH" "$KEYFILE" <<'PY'
+import json,sys
+auth,keyf=sys.argv[1:3]
+key=open(keyf).read().strip()
+with open(auth,"w") as f: json.dump({"OPENAI_API_KEY":key},f)
+PY
+  chmod 600 "$AUTH"
+  ensure_relay_block
+  set_provider "$RELAY_ID"
+  sync_meta "$RELAY_ID"
+  restart_mcp
+  echo "已切换到 relay ($RELAY_URL, provider id=$RELAY_ID)"
+}
+
+cmd_official() {
+  cp "$CFG" "$CFG.bak.codex-switch"
+  if [ -f "$BAK" ]; then
+    cp "$BAK" "$AUTH"; chmod 600 "$AUTH"
+  elif [ "$(auth_kind)" != chatgpt ]; then
+    die "没有官方登录态备份 ($BAK),请先 codex login"
+  fi
+  set_provider openai
+  sync_meta openai
+  restart_mcp
+  echo "已切换到官方订阅 (provider id=openai)"
+}
+
+case "${1:-status}" in
+  status)   cmd_status ;;
+  relay)    cmd_relay ;;
+  official) cmd_official ;;
+  sync)     sync_meta "$(current_provider)"; echo "已同步元数据到 provider=$(current_provider)" ;;
+  *) die "用法: codex-switch {status|relay|official|sync}" ;;
+esac

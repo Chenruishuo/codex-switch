@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""codex-mcp-keeper — 让 Claude Code 与 codex mcp-server 之间的 MCP 连接在
+内层进程重启后依然存活。
+
+背景: codex mcp-server 把 auth 缓存在进程里,codex-switch 切换订阅/中转后必须
+杀掉它;若 Claude Code 直连该进程,杀掉即断联,只能人工 /mcp reconnect。
+本脚本注册为 MCP server 命令(claude mcp 里 codex 的 command 指向它),
+自身保持与 Claude Code 的 stdio 管道,内部拉起真正的 `codex mcp-server`:
+
+- 内层进程死亡(如被 codex-switch pkill)→ 自动重拉,并向新进程重放 MCP 握手
+  (initialize + notifications/initialized,合成 id,应答被吞掉不外传);
+- 死亡时尚未应答的请求,重启后立刻向客户端回 JSON-RPC error,避免外层挂死等待;
+- codex 的会话状态在磁盘(sessions/ + state_*.sqlite),新进程可无缝继续
+  codex-reply 的 thread,Claude Code 全程无感知。
+- 直接拉起原生二进制(跳过 node 包装层,进程语义干净);路径每次重启时重新解析。
+- 自身 argv 不含 "codex mcp-server",因此 pkill -f "codex mcp-server" 杀不到它。
+- 快速连败保护: 60 秒内内层挂 5 次就退出(此时表现同直连断联,人工 /mcp)。
+
+日志: ~/.codex/mcp-keeper.log
+"""
+import glob
+import json
+import os
+import queue
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+LOG = os.path.expanduser("~/.codex/mcp-keeper.log")
+REINIT_ID = "codex-mcp-keeper-reinit"
+HANDSHAKE_TIMEOUT = 60
+MAX_FAILS = 5
+FAIL_WINDOW = 60
+
+current_child = {"p": None}
+
+
+def on_term(sig, frame):
+    c = current_child["p"]
+    if c is not None and c.poll() is None:
+        c.terminate()
+    sys.exit(0)
+
+
+def resolve_cmd():
+    # 优先直接用原生二进制,跳过 node 包装层;每次调用重新解析,兼容 npm 升级换路径。
+    # 覆盖 Linux 与 macOS (npm 全局 / Homebrew node) 的常见安装位置;
+    # 找不到就退回 PATH 上的 codex(原生或 node 包装均可,死活检测基于 stdout EOF)。
+    suffix = "lib/node_modules/@openai/codex/node_modules/@openai/codex-*/vendor/*/bin/codex"
+    for prefix in ("/usr/local/", "/opt/homebrew/",
+                   os.path.expanduser("~/.npm-global/"), "/usr/"):
+        m = sorted(glob.glob(prefix + suffix))
+        if m:
+            return [m[0], "mcp-server"]
+    return ["codex", "mcp-server"]
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(f"{time.strftime('%F %T')} [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
+def parse(line):
+    try:
+        m = json.loads(line)
+        return m if isinstance(m, dict) else None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+client_q = queue.Queue()
+init_msgs = {}  # "initialize" / "initialized" 的原始行,用于重放
+pending_ids = {}  # 已转发给内层、尚未应答的请求 id → 原始 id 值
+plock = threading.Lock()
+out_lock = threading.Lock()
+
+
+def write_out(data):
+    with out_lock:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
+def client_reader():
+    try:
+        for line in sys.stdin.buffer:
+            m = parse(line)
+            if m is not None:
+                if m.get("method") == "initialize":
+                    init_msgs["initialize"] = line
+                elif m.get("method") == "notifications/initialized":
+                    init_msgs["initialized"] = line
+            client_q.put(line)
+    finally:
+        client_q.put(None)
+
+
+def reap(child):
+    try:
+        child.kill()
+        child.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def fail_pending():
+    """向客户端为所有未决请求回错误,避免其永远等待。"""
+    with plock:
+        ids = list(pending_ids.values())
+        pending_ids.clear()
+    for rid in ids:
+        resp = {"jsonrpc": "2.0", "id": rid, "error": {
+            "code": -32603,
+            "message": "codex mcp-server was restarted (auth/provider switch); please retry"}}
+        write_out((json.dumps(resp) + "\n").encode())
+    if ids:
+        log(f"returned error for {len(ids)} in-flight request(s): {ids}")
+
+
+def replay_handshake(child, skip):
+    """向重启后的内层进程重放握手;应答不转发给客户端。成功返回 True。"""
+    if "initialize" not in init_msgs or skip:
+        return True  # 客户端还没握过手(或原 initialize 即将自然流入),无需重放
+    m = json.loads(init_msgs["initialize"])
+    m["id"] = REINIT_ID
+    child.stdin.write((json.dumps(m) + "\n").encode())
+    child.stdin.flush()
+    got = {"ok": False}
+
+    def wait_resp():
+        for line in child.stdout:
+            r = parse(line)
+            if r is None:
+                continue
+            if r.get("id") == REINIT_ID:
+                if "error" in r:
+                    log(f"handshake replay rejected: {line[:200]!r}")
+                else:
+                    got["ok"] = True
+                return
+            # 握手完成前内层不应主动发消息;若有,丢弃并记录
+            log(f"dropped pre-handshake message: {line[:200]!r}")
+
+    t = threading.Thread(target=wait_resp, daemon=True)
+    t.start()
+    t.join(HANDSHAKE_TIMEOUT)
+    if not got["ok"]:
+        log("handshake replay failed or timed out")
+        return False
+    if "initialized" in init_msgs:
+        child.stdin.write(init_msgs["initialized"])
+        child.stdin.flush()
+    return True
+
+
+def main():
+    log("keeper start")
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    threading.Thread(target=client_reader, daemon=True).start()
+    fails = []
+    first = True
+    pending_line = None  # 内层死亡时未写入的行,重启后补发
+    while True:
+        started = time.time()
+        cmd = resolve_cmd()
+        try:
+            child = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=open(LOG + ".child-stderr", "ab"),
+            )
+        except OSError as e:
+            log(f"spawn failed ({cmd}): {e}")
+            sys.exit(1)
+        current_child["p"] = child
+        log(f"child spawned pid={child.pid}" + (" (respawn)" if not first else ""))
+        if not first:
+            # 若未写入的 pending_line 恰是 initialize,则让它自然流入,不做合成重放
+            pm = parse(pending_line) if pending_line is not None else None
+            skip = pm is not None and pm.get("method") == "initialize"
+            try:
+                ok = replay_handshake(child, skip)
+            except OSError as e:
+                log(f"replay error: {e}")
+                ok = False
+            if not ok:
+                reap(child)
+                fails.append(time.time())
+                fails = [x for x in fails if time.time() - x < FAIL_WINDOW]
+                if len(fails) >= MAX_FAILS:
+                    log("too many failures, giving up")
+                    sys.exit(1)
+                time.sleep(1)
+                continue
+            fail_pending()  # 上一代未应答的请求,给客户端回明确错误
+        first = False
+
+        dead = threading.Event()  # 内层 stdout EOF = 服务实际死亡(比退出码更可靠)
+
+        def pump_out(c=child, d=dead):
+            try:
+                for line in c.stdout:
+                    r = parse(line)
+                    if r is not None and "id" in r and "method" not in r:
+                        with plock:
+                            pending_ids.pop(json.dumps(r["id"]), None)
+                    write_out(line)
+            finally:
+                d.set()
+
+        out_t = threading.Thread(target=pump_out, daemon=True)
+        out_t.start()
+
+        while True:  # client → child,直到内层死亡或客户端 EOF
+            if pending_line is not None:
+                line, pending_line = pending_line, None
+            else:
+                try:
+                    line = client_q.get(timeout=0.5)
+                except queue.Empty:
+                    if dead.is_set() or child.poll() is not None:
+                        break
+                    continue
+            if line is None:
+                log("client EOF, shutting down")
+                child.terminate()
+                sys.exit(0)
+            # 请求 id 在写入前登记(应答可能先于登记到达);写入失败则撤销(该行会重发)
+            m = parse(line)
+            req_key = json.dumps(m["id"]) if (m is not None and "id" in m and "method" in m) else None
+            if req_key is not None:
+                with plock:
+                    pending_ids[req_key] = m["id"]
+            try:
+                child.stdin.write(line)
+                child.stdin.flush()
+            except (BrokenPipeError, OSError):
+                if req_key is not None:
+                    with plock:
+                        pending_ids.pop(req_key, None)
+                pending_line = line
+                break
+
+        reap(child)
+        out_t.join(timeout=3)
+        uptime = time.time() - started
+        log(f"child pid={child.pid} exited (code={child.poll()}, uptime={uptime:.1f}s), respawning")
+        fails.append(time.time())
+        fails = [x for x in fails if time.time() - x < FAIL_WINDOW]
+        if len(fails) >= MAX_FAILS:
+            log("too many failures, giving up")
+            sys.exit(1)
+        time.sleep(0.3)
+
+
+if __name__ == "__main__":
+    main()
