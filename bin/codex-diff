@@ -23,8 +23,8 @@ MUTATING_COMMAND = re.compile(
     r"(?:-[A-Za-z]*i[A-Za-z]*(?:\.[^\s;&|]+)?|--in-place(?:=[^\s;&|]+)?)(?=\s|$)|"
     r"\bawk\b[^\n;&|]*\s-i\s+inplace\b|"
     r"\bgit\s+(?:(?:-C|--work-tree|--git-dir)\s+\S+\s+)*"
-    r"(?:apply|am|checkout|restore|clean|mv|rm)\b|"
-    r"\b(?:patch|ed|ex)\b|\b(?:tar\b[^\n;&|]*\s-x|unzip\b)",
+    r"(?:apply|am|checkout|switch|restore|reset|stash|clean|mv|rm)\b|"
+    r"\b(?:patch|ed|ex|tee)\b|\b(?:tar\b[^\n;&|]*\s-x|unzip\b)",
 )
 JS_STRING = re.compile(
     r'"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|`((?:\\.|[^`\\])*)`',
@@ -97,11 +97,19 @@ def read_meta(path: str) -> dict[str, Any]:
     return payload
 
 
+def rollout_paths() -> list[str]:
+    # archived_sessions 是 Codex 桌面端归档会话的去处，漏掉会让归档过的会话查不到。
+    paths = []
+    for sub in ("sessions", "archived_sessions"):
+        pattern = os.path.join(CODEX_DIR, sub, "**", "rollout-*.jsonl")
+        paths.extend(glob.iglob(pattern, recursive=True))
+    return paths
+
+
 def scan_rollouts() -> tuple[list[Rollout], bool]:
-    pattern = os.path.join(CODEX_DIR, "sessions", "**", "rollout-*.jsonl")
     rollouts = []
     incomplete = False
-    for path in glob.iglob(pattern, recursive=True):
+    for path in rollout_paths():
         meta = read_meta(path)
         thread_id = meta.get("id") or meta.get("session_id")
         if not isinstance(thread_id, str):
@@ -429,6 +437,78 @@ def event_key(event: PatchEvent | WriteCommand) -> tuple[float, str, int]:
     return event.sort_time, event.rollout.thread_id, event.line_number
 
 
+def count_diff_lines(unified_diff: object) -> tuple[int, int]:
+    if not isinstance(unified_diff, str):
+        return 0, 0
+    plus = minus = 0
+    for line in unified_diff.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("+"):
+            plus += 1
+        elif line.startswith("-"):
+            minus += 1
+    return plus, minus
+
+
+def summarize(patches: Sequence[PatchEvent]) -> tuple[dict[str, dict[str, Any]], int]:
+    """按文件汇总落盘结果。只统计成功的补丁，失败的单独计数。"""
+    files: dict[str, dict[str, Any]] = {}
+    failed = 0
+    for event in patches:
+        if event.payload.get("success") is not True:
+            failed += 1
+            continue
+        changes = event.payload.get("changes")
+        if not isinstance(changes, dict):
+            continue
+        for path, change in changes.items():
+            if not isinstance(change, dict):
+                continue
+            entry = files.setdefault(
+                path, {"plus": 0, "minus": 0, "last": "?", "moved_to": None}
+            )
+            change_type = change.get("type", "?")
+            entry["last"] = change_type
+            if change_type == "add":
+                content = change.get("content")
+                entry["plus"] += len(content.splitlines()) if isinstance(content, str) else 0
+            elif change_type == "delete":
+                content = change.get("content")
+                entry["minus"] += len(content.splitlines()) if isinstance(content, str) else 0
+            elif change_type == "update":
+                plus, minus = count_diff_lines(change.get("unified_diff"))
+                entry["plus"] += plus
+                entry["minus"] += minus
+                if isinstance(change.get("move_path"), str):
+                    entry["moved_to"] = change["move_path"]
+            entry.setdefault("types", set()).add(change_type)
+    return files, failed
+
+
+def print_summary(files: dict[str, dict[str, Any]], failed: int) -> None:
+    head = f"=== 摘要: {len(files)} 个文件落盘"
+    if failed:
+        head += f"，另有 {failed} 个补丁应用失败（未落盘）"
+    print(head + " ===")
+    width = max((len(path) for path in files), default=0)
+    for path, entry in files.items():
+        if entry["last"] == "delete":
+            mark = "D"
+        elif "add" in entry.get("types", set()):
+            mark = "A"
+        else:
+            mark = "M"
+        counts = []
+        if entry["plus"]:
+            counts.append(f"+{entry['plus']}")
+        if entry["minus"]:
+            counts.append(f"-{entry['minus']}")
+        suffix = f"  -> {entry['moved_to']} (改名)" if entry["moved_to"] else ""
+        print(f"  {mark} {path:<{width}}  {' '.join(counts) or '(无行变化)'}{suffix}")
+    print()
+
+
 def print_patch(event: PatchEvent, root_id: str) -> None:
     success = event.payload.get("success")
     if success is True:
@@ -508,6 +588,9 @@ def show(root: Rollout, rollouts: Sequence[Rollout]) -> bool:
 
     patches.sort(key=event_key)
     writes.sort(key=event_key)
+    files, failed = summarize(patches)
+    if files or failed:
+        print_summary(files, failed)
     for patch in patches:
         print_patch(patch, root.thread_id)
     if not patches:
