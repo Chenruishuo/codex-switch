@@ -1,101 +1,594 @@
 #!/usr/bin/env python3
-"""codex-diff — 事后查看某次 Codex 会话到底改了哪些文件、改了什么。
+"""事后查看一次 Codex 会话及其子线程应用过的补丁。"""
 
-用法:
-  codex-diff              # 最近一次会话
-  codex-diff <thread-id>  # 指定会话(MCP 返回的 threadId,或 rollout 文件名里的 id)
-  codex-diff -n 5         # 列出最近 5 次会话供挑选
-
-原理: Codex 把每次 apply_patch 的原始补丁、以及每条执行过的 shell 命令都写进
-~/.codex/sessions/**/rollout-*.jsonl。即使改文件前没打快照,这里也能还原改动。
-注意: 通过 shell 重定向/sed 等方式写文件不会产生 patch 记录,本工具会把可疑的
-写命令单独列出提醒(需自行判断)。
-"""
+import argparse
 import glob
 import json
 import os
 import re
+import shlex
 import sys
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Sequence
 
-HOME = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
-WRITE_HINT = re.compile(
-    r"\bsed\s+-i\b|\btee\b|\bdd\s+if=|\btruncate\b|\b(mv|cp|rm|mkdir|chmod|touch)\s|"
-    r"(?<![=\-<&\d])>>?\s*(?!/dev/null|&\d)[\w./$~'\"-]")  # 排除 =>、2>&1、>/dev/null
+CODEX_DIR = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+MUTATING_COMMAND = re.compile(
+    r"(?:^|(?:&&|\|\||[;|])\s*|\b(?:then|do|else)\s+)"
+    r"(?:(?:sudo|command)\s+|env(?:\s+\w+=\S+)*\s+|\w+=\S+\s+)*"
+    r"(?:\S*/)?"
+    r"(?:apply_patch|cp|mv|rm|mkdir|rmdir|chmod|chown|touch|ln|install|truncate|rsync)\b|"
+    r"\bdd\b[^\n;&|]*\bof=|"
+    r"\b(?:sed|perl|ruby)\b[^\n;&|]*\s"
+    r"(?:-[A-Za-z]*i[A-Za-z]*(?:\.[^\s;&|]+)?|--in-place(?:=[^\s;&|]+)?)(?=\s|$)|"
+    r"\bawk\b[^\n;&|]*\s-i\s+inplace\b|"
+    r"\bgit\s+(?:(?:-C|--work-tree|--git-dir)\s+\S+\s+)*"
+    r"(?:apply|am|checkout|restore|clean|mv|rm)\b|"
+    r"\b(?:patch|ed|ex)\b|\b(?:tar\b[^\n;&|]*\s-x|unzip\b)",
+)
+JS_STRING = re.compile(
+    r'"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|`((?:\\.|[^`\\])*)`',
+    re.DOTALL,
+)
+RELEVANT_PAYLOAD = re.compile(
+    r'"type"\s*:\s*"(?:patch_apply_end|function_call|custom_tool_call)"'
+)
 
 
-def sessions():
-    fs = glob.glob(os.path.join(HOME, "sessions", "**", "rollout-*.jsonl"), recursive=True)
-    return sorted(fs, key=os.path.getmtime, reverse=True)
+@dataclass(frozen=True)
+class Rollout:
+    path: str
+    thread_id: str
+    parent_thread_id: str | None
+    timestamp: str
+    cwd: str
+    sort_time: float
 
 
-def show(path):
-    meta, patches, writes = {}, [], []
-    for line in open(path):
-        try:
-            d = json.loads(line)
-        except ValueError:
+@dataclass(frozen=True)
+class PatchEvent:
+    timestamp: str
+    sort_time: float
+    line_number: int
+    rollout: Rollout
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class WriteCommand:
+    timestamp: str
+    sort_time: float
+    line_number: int
+    rollout: Rollout
+    command: str
+    cwd: str
+
+
+def warn(message: str) -> None:
+    print(f"警告: {message}", file=sys.stderr)
+
+
+def parse_time(value: object, fallback: float = 0.0) -> float:
+    if not isinstance(value, str) or not value:
+        return fallback
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return fallback
+
+
+def read_meta(path: str) -> dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as fp:
+            data = json.loads(fp.readline())
+    except (OSError, json.JSONDecodeError) as exc:
+        warn(f"无法读取 session_meta，跳过 {path}: {exc}")
+        return {}
+    if not isinstance(data, dict):
+        warn(f"首行不是 JSON 对象，跳过 {path}")
+        return {}
+    if data.get("type") != "session_meta":
+        warn(f"首行类型不是 session_meta，跳过 {path}")
+        return {}
+    payload = data.get("payload") or {}
+    if not isinstance(payload, dict) or not (payload.get("id") or payload.get("session_id")):
+        warn(f"首行没有有效 session_meta，跳过 {path}")
+        return {}
+    return payload
+
+
+def scan_rollouts() -> tuple[list[Rollout], bool]:
+    pattern = os.path.join(CODEX_DIR, "sessions", "**", "rollout-*.jsonl")
+    rollouts = []
+    incomplete = False
+    for path in glob.iglob(pattern, recursive=True):
+        meta = read_meta(path)
+        thread_id = meta.get("id") or meta.get("session_id")
+        if not isinstance(thread_id, str):
+            incomplete = True
             continue
-        p = d.get("payload") or {}
-        if not meta and p.get("session_id"):
-            meta = p
-        inp = p.get("input") or ""
-        if p.get("type") == "custom_tool_call" and "apply_patch" in inp:
-            m = re.search(r'"(\*\*\* Begin Patch.*?\*\*\* End Patch)"', inp, re.S)
-            if m:
-                patches.append(m.group(1).encode().decode("unicode_escape"))
-        if p.get("type") in ("function_call", "custom_tool_call"):
-            args = p.get("arguments") or inp
-            cmd = None
-            if isinstance(args, str) and args.strip().startswith("{"):
-                try:
-                    c = json.loads(args).get("command")
-                    cmd = " ".join(x for x in c if isinstance(x, str)) if isinstance(c, list) else c
-                except ValueError:
-                    pass
-                if not isinstance(cmd, str):
-                    cmd = None
-            elif p.get("name") in ("shell", "exec") and "apply_patch" not in inp:
-                cmd = inp.strip()
-            if cmd:  # 逐行判断,避免整段脚本因一行命中而全量刷屏
-                for ln in cmd.splitlines():
-                    ln = ln.strip()
-                    if ln and WRITE_HINT.search(ln) and ln[:200] not in writes:
-                        writes.append(ln[:200])
+        timestamp = meta.get("timestamp") if isinstance(meta.get("timestamp"), str) else ""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        rollouts.append(
+            Rollout(
+                path=path,
+                thread_id=thread_id,
+                parent_thread_id=(
+                    meta.get("parent_thread_id")
+                    if isinstance(meta.get("parent_thread_id"), str)
+                    else None
+                ),
+                timestamp=timestamp,
+                cwd=meta.get("cwd") if isinstance(meta.get("cwd"), str) else "?",
+                sort_time=parse_time(timestamp, mtime),
+            )
+        )
+    return (
+        sorted(rollouts, key=lambda rollout: rollout.sort_time, reverse=True),
+        incomplete,
+    )
 
-    print(f"会话: {os.path.basename(path)}")
-    print(f"目录: {meta.get('cwd', '?')}   时间: {meta.get('timestamp', '?')}")
-    print()
-    if patches:
-        print(f"=== apply_patch 改动 ({len(patches)} 处) ===")
-        for pt in patches:
-            print(pt)
-            print()
+
+def resolve_rollout(rollouts: Sequence[Rollout], query: str) -> Rollout:
+    exact = [rollout for rollout in rollouts if rollout.thread_id == query]
+    if exact:
+        return exact[0]
+
+    prefixes = {
+        rollout.thread_id: rollout
+        for rollout in reversed(rollouts)
+        if rollout.thread_id.startswith(query)
+    }
+    if len(prefixes) == 1:
+        return next(iter(prefixes.values()))
+    if len(prefixes) > 1:
+        matches = ", ".join(list(prefixes)[:5])
+        raise SystemExit(f"线程 ID 前缀不唯一: {query}（匹配 {matches}）")
+    raise SystemExit(f"找不到会话: {query}")
+
+
+def thread_family(root: Rollout, rollouts: Sequence[Rollout]) -> list[Rollout]:
+    children: dict[str, list[Rollout]] = {}
+    same_thread: dict[str, list[Rollout]] = {}
+    for rollout in rollouts:
+        same_thread.setdefault(rollout.thread_id, []).append(rollout)
+        if rollout.parent_thread_id:
+            children.setdefault(rollout.parent_thread_id, []).append(rollout)
+
+    family = []
+    seen_paths = set()
+    expanded_ids = set()
+    pending = [root]
+    while pending:
+        rollout = pending.pop()
+        if rollout.path in seen_paths:
+            continue
+        seen_paths.add(rollout.path)
+        family.append(rollout)
+        if rollout.thread_id not in expanded_ids:
+            expanded_ids.add(rollout.thread_id)
+            pending.extend(same_thread.get(rollout.thread_id, []))
+            pending.extend(children.get(rollout.thread_id, []))
+    return family
+
+
+def decode_js_string(body: str, quote: str) -> str:
+    if quote == '"':
+        try:
+            value = json.loads(f'"{body}"')
+            if isinstance(value, str):
+                return value
+        except json.JSONDecodeError:
+            pass
+
+    escapes = {
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+        "`": "`",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "/": "/",
+    }
+    return re.sub(
+        r"\\(.)",
+        lambda match: escapes.get(match.group(1), match.group(0)),
+        body,
+        flags=re.DOTALL,
+    )
+
+
+def javascript_strings(source: str) -> list[str]:
+    strings = []
+    for match in JS_STRING.finditer(source):
+        for index, quote in enumerate(('"', "'", "`"), start=1):
+            body = match.group(index)
+            if body is not None:
+                strings.append(decode_js_string(body, quote))
+                break
+    return strings
+
+
+def has_file_redirection(command: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            continue
+        if char != ">" or (index and command[index - 1] in "<=>-"):
+            index += 1
+            continue
+        if index + 1 < len(command) and command[index + 1] == "=":
+            index += 1
+            continue
+
+        target = index + 1
+        if target < len(command) and command[target] == ">":
+            target += 1
+        while target < len(command) and command[target].isspace():
+            target += 1
+        if target >= len(command):
+            index = target
+            continue
+        if command[target] == "&" and target + 1 < len(command):
+            if command[target + 1].isdigit() or command[target + 1] == "-":
+                index = target + 2
+                continue
+
+        target_quote = command[target] if command[target] in ("'", '"') else None
+        if target_quote:
+            target += 1
+        end = target
+        while end < len(command):
+            if target_quote and command[end] == target_quote:
+                break
+            if not target_quote and (command[end].isspace() or command[end] in ";|&"):
+                break
+            end += 1
+        target_path = command[target:end]
+        if target_path not in ("/dev/null", "/dev/stdout", "/dev/stderr"):
+            return True
+        index = end + 1
+    return False
+
+
+def without_quoted_text(command: str) -> str:
+    result = []
+    quote: str | None = None
+    escaped = False
+    for char in command:
+        if escaped:
+            result.append(" " if quote else char)
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            result.append(" ")
+            escaped = True
+            continue
+        if quote:
+            result.append(" ")
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            result.append(" ")
+            quote = char
+            continue
+        result.append(char)
+    return "".join(result)
+
+
+def nested_shell_scripts(command: str) -> list[str]:
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return []
+    scripts = []
+    for index, token in enumerate(tokens[:-1]):
+        if os.path.basename(token) not in ("bash", "sh", "zsh", "dash"):
+            continue
+        option = tokens[index + 1]
+        if option.startswith("-") and "c" in option and index + 2 < len(tokens):
+            scripts.append(tokens[index + 2])
+    return scripts
+
+
+def looks_like_write(command: str) -> bool:
+    if has_file_redirection(command):
+        return True
+    if MUTATING_COMMAND.search(without_quoted_text(command)) is not None:
+        return True
+    return any(looks_like_write(script) for script in nested_shell_scripts(command))
+
+
+def normalize_command(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(part, str) for part in value):
+        return [" ".join(value)]
+    return []
+
+
+def commands_from_call(payload: dict[str, Any]) -> list[tuple[str, str | None]]:
+    if payload.get("type") not in ("function_call", "custom_tool_call"):
+        return []
+
+    name = payload.get("name")
+    raw = payload.get("arguments")
+    if raw is None:
+        raw = payload.get("input")
+
+    decoded: object = raw
+    if isinstance(raw, str) and raw.lstrip().startswith("{"):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            decoded = raw
+
+    if isinstance(decoded, dict):
+        commands = normalize_command(decoded.get("cmd"))
+        commands += normalize_command(decoded.get("command"))
+        if name == "write_stdin":
+            commands += normalize_command(decoded.get("chars"))
+        cwd = decoded.get("workdir")
+        cwd = cwd if isinstance(cwd, str) else None
+        return [(command, cwd) for command in commands]
+
+    if not isinstance(raw, str):
+        return []
+    if name in ("exec_command", "shell"):
+        return [(raw, None)]
+    if name in ("exec", "functions.exec"):
+        if re.search(r"\btools\.(?:exec_command|write_stdin)\s*\(", raw):
+            return [
+                (value, None)
+                for value in javascript_strings(raw)
+                if "*** Begin Patch" not in value
+            ]
+        if "apply_patch" not in raw:
+            return [(raw, None)]
+    return []
+
+
+def collect(
+    rollout: Rollout,
+) -> tuple[list[PatchEvent], list[WriteCommand], bool]:
+    patches = []
+    writes = []
+    incomplete = False
+    try:
+        fp = open(rollout.path, encoding="utf-8")
+    except OSError as exc:
+        warn(f"无法读取 rollout {rollout.path}: {exc}")
+        return patches, writes, True
+
+    with fp:
+        for line_number, line in enumerate(fp, start=1):
+            if RELEVANT_PAYLOAD.search(line) is None:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as exc:
+                warn(f"JSON 无效，已跳过 {rollout.path}:{line_number}: {exc}")
+                incomplete = True
+                continue
+            if not isinstance(data, dict):
+                warn(f"记录不是 JSON 对象，已跳过 {rollout.path}:{line_number}")
+                incomplete = True
+                continue
+            payload = data.get("payload") or {}
+            if not isinstance(payload, dict):
+                warn(f"payload 不是 JSON 对象，已跳过 {rollout.path}:{line_number}")
+                incomplete = True
+                continue
+            timestamp = data.get("timestamp") if isinstance(data.get("timestamp"), str) else "?"
+            sort_time = parse_time(timestamp, rollout.sort_time)
+            if payload.get("type") == "patch_apply_end":
+                patches.append(
+                    PatchEvent(timestamp, sort_time, line_number, rollout, payload)
+                )
+            for command, cwd in commands_from_call(payload):
+                for command_line in command.splitlines():
+                    command_line = command_line.strip()
+                    if command_line and looks_like_write(command_line):
+                        writes.append(
+                            WriteCommand(
+                                timestamp,
+                                sort_time,
+                                line_number,
+                                rollout,
+                                command_line,
+                                cwd or f"{rollout.cwd}（会话目录回退）",
+                            )
+                        )
+    return patches, writes, incomplete
+
+
+def event_key(event: PatchEvent | WriteCommand) -> tuple[float, str, int]:
+    return event.sort_time, event.rollout.thread_id, event.line_number
+
+
+def print_patch(event: PatchEvent, root_id: str) -> None:
+    success = event.payload.get("success")
+    if success is True:
+        mark = "OK"
+    elif success is False:
+        mark = "!! 应用失败，未落盘"
     else:
-        print("=== 无 apply_patch 记录(未通过补丁方式改文件)===\n")
-    if writes:
-        print(f"=== 可能写文件的 shell 命令 ({len(writes)} 条,需自行判断)===")
-        for c in writes:
-            print(f"  $ {c}")
+        mark = "?? success 状态缺失"
+    role = "主线程" if event.rollout.thread_id == root_id else "子线程"
+    print(
+        f"--- 补丁 [{mark}] {event.timestamp}  "
+        f"({role} {event.rollout.thread_id})"
+    )
 
-
-def main():
-    a = sys.argv[1:]
-    if a and a[0] == "-n":
-        for f in sessions()[: int(a[1]) if len(a) > 1 else 10]:
-            m = re.search(r"rollout-(\S+?)-([0-9a-f-]{36})\.jsonl", os.path.basename(f))
-            print(f"{m.group(1) if m else '?'}  {m.group(2) if m else os.path.basename(f)}")
+    changes = event.payload.get("changes")
+    if not isinstance(changes, dict) or not changes:
+        print("(无 changes 记录)")
+        print()
         return
-    if a:
-        hits = [f for f in sessions() if a[0] in f]
-        if not hits:
-            sys.exit(f"找不到会话: {a[0]}")
-        show(hits[0])
+    for path, change in changes.items():
+        if not isinstance(change, dict):
+            print(f"? {path}: {change!r}")
+            continue
+        change_type = change.get("type", "?")
+        if change_type == "add":
+            content = change.get("content")
+            if not isinstance(content, str):
+                print("(无 content 记录)")
+                continue
+            lines = content.splitlines()
+            print(f"A {path}  (+{len(lines)} 行)")
+            for line in lines:
+                print(f"+{line}")
+            if content and not content.endswith("\n"):
+                print("\\ No newline at end of file")
+        elif change_type == "update":
+            move_path = change.get("move_path")
+            suffix = f"  -> {move_path} (改名)" if isinstance(move_path, str) else ""
+            print(f"M {path}{suffix}")
+            unified_diff = change.get("unified_diff")
+            if isinstance(unified_diff, str) and unified_diff:
+                print(unified_diff, end="" if unified_diff.endswith("\n") else "\n")
+            else:
+                print("(无 unified_diff 记录)")
+        elif change_type == "delete":
+            print(f"D {path}")
+            content = change.get("content")
+            if isinstance(content, str):
+                for line in content.splitlines():
+                    print(f"-{line}")
+                if content and not content.endswith("\n"):
+                    print("\\ No newline at end of file")
+        else:
+            detail = json.dumps(change, ensure_ascii=False)[:500]
+            print(f"? {path}: {detail}")
+    print()
+
+
+def show(root: Rollout, rollouts: Sequence[Rollout]) -> bool:
+    family = thread_family(root, rollouts)
+    child_count = len({rollout.thread_id for rollout in family} - {root.thread_id})
+    print(
+        f"会话: {root.thread_id}"
+        + (f"  (+{child_count} 个子 agent 线程)" if child_count else "")
+    )
+    print(f"目录: {root.cwd}   时间: {root.timestamp or '?'}")
+    print()
+
+    patches = []
+    writes = []
+    incomplete = False
+    for rollout in family:
+        rollout_patches, rollout_writes, rollout_incomplete = collect(rollout)
+        patches.extend(rollout_patches)
+        writes.extend(rollout_writes)
+        incomplete = incomplete or rollout_incomplete
+
+    patches.sort(key=event_key)
+    writes.sort(key=event_key)
+    for patch in patches:
+        print_patch(patch, root.thread_id)
+    if not patches:
+        print("=== 无补丁记录（未通过 apply_patch 改文件）===")
+        print()
+
+    if writes:
+        print(f"=== 可能写文件的 shell 命令 ({len(writes)} 条，需自行判断) ===")
+        for write in writes:
+            role = "主线程" if write.rollout.thread_id == root.thread_id else "子线程"
+            print(
+                f"  [{write.timestamp}] [{role} {write.rollout.thread_id}]"
+                f" [目录 {write.cwd}]\n  $ {write.command}"
+            )
+    return incomplete
+
+
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是正整数") from exc
+    if number <= 0:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return number
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="显示 Codex 会话及其所有子线程应用过的补丁。"
+    )
+    parser.add_argument("thread_id", nargs="?", help="完整线程 ID 或唯一 ID 前缀")
+    parser.add_argument(
+        "-n",
+        "--list",
+        nargs="?",
+        const=10,
+        type=positive_int,
+        metavar="N",
+        help="列出最近 N 个顶层会话（默认 10）",
+    )
+    args = parser.parse_args(argv)
+    if args.list is not None and args.thread_id:
+        parser.error("不能同时指定 thread_id 和 --list")
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    rollouts, scan_incomplete = scan_rollouts()
+    if not rollouts:
+        raise SystemExit("没有会话记录")
+
+    roots = []
+    root_ids = set()
+    for rollout in rollouts:
+        if rollout.parent_thread_id is None and rollout.thread_id not in root_ids:
+            root_ids.add(rollout.thread_id)
+            roots.append(rollout)
+    if args.list is not None:
+        if not roots:
+            raise SystemExit("没有顶层会话记录")
+        for rollout in roots[: args.list]:
+            print(f"{rollout.timestamp or '?'}  {rollout.thread_id}  {rollout.cwd}")
+        return 1 if scan_incomplete else 0
+
+    if args.thread_id:
+        root = resolve_rollout(rollouts, args.thread_id)
     else:
-        fs = sessions()
-        if not fs:
-            sys.exit("没有会话记录")
-        show(fs[0])
+        if not roots:
+            raise SystemExit("没有顶层会话记录")
+        root = roots[0]
+    family_incomplete = show(root, rollouts)
+    return 1 if scan_incomplete or family_incomplete else 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        finally:
+            raise SystemExit(0) from None
