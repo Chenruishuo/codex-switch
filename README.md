@@ -1,6 +1,8 @@
 # codex-switch
 
-在 Codex 的**官方 ChatGPT 订阅**与**中转 relay**(默认 cctq, `https://www.cctq.ai/v1`)之间一键切换,并保证:
+在 Codex 的**官方 ChatGPT 订阅**与**中转 relay**(默认 cctq, `https://www.cctq.ai/v1`)之间一键切换。
+切换是**全局**的——TUI、`codex exec`、MCP server 共用同一份 `~/.codex/config.toml` + `auth.json`,
+切完全部生效(已开着的 TUI 会话需重开)。并保证:
 
 - 官方登录态自动备份/恢复(`~/.codex/auth.official.json`);
 - 历史会话不"消失"——自动同步 `state_*.sqlite` 与 `sessions/` rollout 的 provider 元数据
@@ -12,7 +14,7 @@
 ## 安装
 
 ```bash
-git clone git@github.com:Chenruishuo/codex-switch.git
+git clone https://github.com/Chenruishuo/codex-switch.git
 cd codex-switch && ./install.sh
 printf '%s' 'sk-你的token' > ~/.codex/cctq.key && chmod 600 ~/.codex/cctq.key
 ```

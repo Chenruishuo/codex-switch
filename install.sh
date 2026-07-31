@@ -7,7 +7,13 @@ cp bin/codex-switch bin/codex-mcp-keeper "$HOME/bin/"
 chmod +x "$HOME/bin/codex-switch" "$HOME/bin/codex-mcp-keeper"
 case ":$PATH:" in
   *":$HOME/bin:"*) ;;
-  *) echo "提示: ~/bin 不在 PATH 里,请自行加入 shell 配置 (export PATH=\"\$HOME/bin:\$PATH\")" ;;
+  *)
+    case "${SHELL:-}" in */zsh) rc="$HOME/.zshrc" ;; *) rc="$HOME/.bashrc" ;; esac
+    if ! grep -qs 'HOME/bin' "$rc" 2>/dev/null; then
+      printf '\nexport PATH="$HOME/bin:$PATH"\n' >> "$rc"
+    fi
+    echo "已把 ~/bin 加入 PATH ($rc);重开终端或 source $rc 后生效"
+    ;;
 esac
 if command -v claude >/dev/null 2>&1; then
   claude mcp remove codex -s user >/dev/null 2>&1 || true
