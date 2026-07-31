@@ -3,6 +3,7 @@
 
 import argparse
 import glob
+import heapq
 import json
 import os
 import re
@@ -13,25 +14,38 @@ from datetime import datetime
 from typing import Any, Sequence
 
 CODEX_DIR = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+UNKNOWN_STDIN_CWD = "未知（write_stdin 未携带目录）"
 MUTATING_COMMAND = re.compile(
-    r"(?:^|(?:&&|\|\||[;|])\s*|\b(?:then|do|else)\s+)"
-    r"(?:(?:sudo|command)\s+|env(?:\s+\w+=\S+)*\s+|\w+=\S+\s+)*"
+    r"(?:^|(?:&&|\|\||[;|])\s*|[({!]\s*|\b(?:then|do|else)\s+)"
+    r"(?:(?:sudo|command|builtin|exec|nohup)\s+|"
+    r"env(?:\s+\w+=\S+)*\s+|\w+=\S+\s+)*"
     r"(?:\S*/)?"
-    r"(?:apply_patch|cp|mv|rm|mkdir|rmdir|chmod|chown|touch|ln|install|truncate|rsync)\b|"
+    r"(?:apply_patch|cp|mv|rm|mkdir|rmdir|chmod|chown|touch|ln|install|"
+    r"truncate|rsync|tee|sponge|split|csplit|mktemp)\b|"
     r"\bdd\b[^\n;&|]*\bof=|"
     r"\b(?:sed|perl|ruby)\b[^\n;&|]*\s"
     r"(?:-[A-Za-z]*i[A-Za-z]*(?:\.[^\s;&|]+)?|--in-place(?:=[^\s;&|]+)?)(?=\s|$)|"
     r"\bawk\b[^\n;&|]*\s-i\s+inplace\b|"
     r"\bgit\s+(?:(?:-C|--work-tree|--git-dir)\s+\S+\s+)*"
-    r"(?:apply|am|checkout|switch|restore|reset|stash|clean|mv|rm)\b|"
-    r"\b(?:patch|ed|ex|tee)\b|\b(?:tar\b[^\n;&|]*\s-x|unzip\b)",
+    r"(?:apply|am|checkout|restore|clean|mv|rm|reset|switch|merge|rebase|"
+    r"cherry-pick|revert|stash|init|clone)\b|"
+    r"\bcurl\b[^\n;&|]*\s(?:-[^\s]*[oO](?:\s+|[^\s]+)|--output(?:=|\s))|"
+    r"\bwget\b|"
+    r"\bsort\b[^\n;&|]*\s(?:-o|--output(?:=|\s))|"
+    r"\b(?:black|isort)\b|\bruff\s+(?:format|check\b[^\n;&|]*--fix)\b|"
+    r"\bprettier\b[^\n;&|]*--write\b|\bclang-format\b[^\n;&|]*\s-i\b|"
+    # 解释器和构建工具能写任意文件而不留可识别信号，只能整体标为疑似写入。
+    # 但不含 bash/sh/zsh/dash：这些壳的实际脚本已由 nested_shell_scripts 递归展开，
+    # 把壳本身算进来会让 `bash -lc 'ls'` 这类纯读取命令也被误标。
+    r"(?:^|[/\s])(?:python(?:\d+(?:\.\d+)*)?|node|deno|"
+    r"make|cmake|ninja|pytest|pip(?:\d+(?:\.\d+)*)?|conda|npm|pnpm|yarn|"
+    r"cargo|go)\b|"
+    r"\b(?:patch|ed|ex)\b|\b(?:tar\b[^\n;&|]*\s(?:-?x|--extract)|unzip\b)",
+    re.MULTILINE,
 )
 JS_STRING = re.compile(
     r'"((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|`((?:\\.|[^`\\])*)`',
     re.DOTALL,
-)
-RELEVANT_PAYLOAD = re.compile(
-    r'"type"\s*:\s*"(?:patch_apply_end|function_call|custom_tool_call)"'
 )
 
 
@@ -62,26 +76,41 @@ class WriteCommand:
     rollout: Rollout
     command: str
     cwd: str
+    likely_write: bool
+
+
+# 退出码分两级：日志损坏 / 补丁是否落盘不明属于「硬」问题，必须处理；
+# shell 启发式解析不确定属于「软」问题，在真实日志里约三分之一会话都会命中，
+# 混在一起会让非零退出码失去意义。
+HEURISTIC_UNCERTAIN = False
+
+
+def mark_uncertain() -> None:
+    global HEURISTIC_UNCERTAIN
+    HEURISTIC_UNCERTAIN = True
 
 
 def warn(message: str) -> None:
     print(f"警告: {message}", file=sys.stderr)
 
 
-def parse_time(value: object, fallback: float = 0.0) -> float:
+def parsed_time(value: object) -> float | None:
     if not isinstance(value, str) or not value:
-        return fallback
+        return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return fallback
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def read_meta(path: str) -> dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as fp:
             data = json.loads(fp.readline())
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         warn(f"无法读取 session_meta，跳过 {path}: {exc}")
         return {}
     if not isinstance(data, dict):
@@ -91,14 +120,16 @@ def read_meta(path: str) -> dict[str, Any]:
         warn(f"首行类型不是 session_meta，跳过 {path}")
         return {}
     payload = data.get("payload") or {}
-    if not isinstance(payload, dict) or not (payload.get("id") or payload.get("session_id")):
+    if not isinstance(payload, dict) or not (
+        payload.get("id") or payload.get("session_id")
+    ):
         warn(f"首行没有有效 session_meta，跳过 {path}")
         return {}
     return payload
 
 
 def rollout_paths() -> list[str]:
-    # archived_sessions 是 Codex 桌面端归档会话的去处，漏掉会让归档过的会话查不到。
+    # archived_sessions 是桌面端归档会话的去处，漏掉会让归档过的会话直接查不到。
     paths = []
     for sub in ("sessions", "archived_sessions"):
         pattern = os.path.join(CODEX_DIR, sub, "**", "rollout-*.jsonl")
@@ -111,29 +142,66 @@ def scan_rollouts() -> tuple[list[Rollout], bool]:
     incomplete = False
     for path in rollout_paths():
         meta = read_meta(path)
-        thread_id = meta.get("id") or meta.get("session_id")
-        if not isinstance(thread_id, str):
+        thread_id = next(
+            (
+                value
+                for value in (meta.get("id"), meta.get("session_id"))
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        if thread_id is None:
             incomplete = True
             continue
-        timestamp = meta.get("timestamp") if isinstance(meta.get("timestamp"), str) else ""
+        raw_timestamp = meta.get("timestamp")
+        timestamp = raw_timestamp if isinstance(raw_timestamp, str) else ""
         try:
             mtime = os.path.getmtime(path)
         except OSError:
             mtime = 0.0
+        sort_time = parsed_time(timestamp)
+        if sort_time is None:
+            warn(f"session_meta 时间戳无效，将使用文件 mtime: {path}")
+            incomplete = True
+            sort_time = mtime
+
+        raw_parent = meta.get("parent_thread_id")
+        if raw_parent is None:
+            parent_thread_id = None
+        elif isinstance(raw_parent, str) and raw_parent:
+            parent_thread_id = raw_parent
+        else:
+            warn(f"session_meta parent_thread_id 无效，将按顶层会话处理: {path}")
+            incomplete = True
+            parent_thread_id = None
+
+        raw_cwd = meta.get("cwd")
+        if isinstance(raw_cwd, str) and os.path.isabs(raw_cwd):
+            cwd = raw_cwd
+        else:
+            warn(f"session_meta cwd 不是绝对路径，shell 相对路径可能无法归属: {path}")
+            incomplete = True
+            cwd = raw_cwd if isinstance(raw_cwd, str) and raw_cwd else "?"
         rollouts.append(
             Rollout(
                 path=path,
                 thread_id=thread_id,
-                parent_thread_id=(
-                    meta.get("parent_thread_id")
-                    if isinstance(meta.get("parent_thread_id"), str)
-                    else None
-                ),
+                parent_thread_id=parent_thread_id,
                 timestamp=timestamp,
-                cwd=meta.get("cwd") if isinstance(meta.get("cwd"), str) else "?",
-                sort_time=parse_time(timestamp, mtime),
+                cwd=cwd,
+                sort_time=sort_time,
             )
         )
+
+    known_ids = {rollout.thread_id for rollout in rollouts}
+    for rollout in rollouts:
+        parent_id = rollout.parent_thread_id
+        if parent_id is not None and parent_id not in known_ids:
+            warn(
+                f"找不到父线程 {parent_id}，子线程可能无法归入顶层会话: "
+                f"{rollout.path}"
+            )
+            incomplete = True
     return (
         sorted(rollouts, key=lambda rollout: rollout.sort_time, reverse=True),
         incomplete,
@@ -221,6 +289,444 @@ def javascript_strings(source: str) -> list[str]:
     return strings
 
 
+def starts_javascript_regex(source: str, index: int) -> bool:
+    previous = index - 1
+    while previous >= 0 and source[previous].isspace():
+        previous -= 1
+    if previous < 0 or source[previous] in "([{,:;=!?&|+-*%^~<>":
+        return True
+    prefix = source[:index].rstrip()
+    return re.search(r"\b(?:return|case|throw|yield|await)$", prefix) is not None
+
+
+def javascript_code_mask(source: str) -> str:
+    """Return same-length text with JS literals and comments replaced by spaces."""
+    result = list(source)
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if source.startswith("//", index):
+            while index < len(source) and source[index] != "\n":
+                result[index] = " "
+                index += 1
+            continue
+        if source.startswith("/*", index):
+            result[index : index + 2] = [" ", " "]
+            index += 2
+            while index < len(source):
+                if source.startswith("*/", index):
+                    result[index : index + 2] = [" ", " "]
+                    index += 2
+                    break
+                result[index] = "\n" if source[index] == "\n" else " "
+                index += 1
+            continue
+        if char == "/" and starts_javascript_regex(source, index):
+            in_character_class = False
+            result[index] = " "
+            index += 1
+            while index < len(source):
+                result[index] = "\n" if source[index] == "\n" else " "
+                if source[index] == "\\":
+                    index += 1
+                    if index < len(source):
+                        result[index] = "\n" if source[index] == "\n" else " "
+                elif source[index] == "[":
+                    in_character_class = True
+                elif source[index] == "]":
+                    in_character_class = False
+                elif source[index] == "/" and not in_character_class:
+                    index += 1
+                    while index < len(source) and source[index].isalpha():
+                        result[index] = " "
+                        index += 1
+                    break
+                index += 1
+            continue
+        if char in ('"', "'", "`"):
+            quote = char
+            result[index] = " "
+            index += 1
+            while index < len(source):
+                result[index] = "\n" if source[index] == "\n" else " "
+                if source[index] == "\\":
+                    index += 1
+                    if index < len(source):
+                        result[index] = "\n" if source[index] == "\n" else " "
+                elif source[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        index += 1
+    return "".join(result)
+
+
+def javascript_string_at(source: str, index: int) -> tuple[str, int] | None:
+    while index < len(source) and source[index].isspace():
+        index += 1
+    raw_template = False
+    if source.startswith("String.raw", index):
+        index += len("String.raw")
+        while index < len(source) and source[index].isspace():
+            index += 1
+        raw_template = True
+    if index >= len(source) or source[index] not in ('"', "'", "`"):
+        return None
+
+    quote = source[index]
+    body_start = index + 1
+    index = body_start
+    while index < len(source):
+        if source[index] == "\\":
+            index += 2
+            continue
+        if source[index] == quote:
+            body = source[body_start:index]
+            value = (
+                body
+                if raw_template and quote == "`"
+                else decode_js_string(body, quote)
+            )
+            return value, index + 1
+        index += 1
+    return None
+
+
+def javascript_bindings(source: str, masked: str) -> dict[str, str]:
+    bindings = {}
+    assignment = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*")
+    for match in assignment.finditer(source):
+        if masked[match.start()] != source[match.start()]:
+            continue
+        parsed = javascript_string_at(source, match.end())
+        if parsed is not None:
+            bindings[match.group(1)] = parsed[0]
+    return bindings
+
+
+def javascript_array_bindings(source: str, masked: str) -> dict[str, list[Any]]:
+    bindings = {}
+    assignment = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*")
+    for match in assignment.finditer(source):
+        if masked[match.start()] != source[match.start()]:
+            continue
+        start = match.end()
+        while start < len(source) and source[start].isspace():
+            start += 1
+        if start >= len(source) or source[start] != "[":
+            continue
+        depth = 1
+        end = start + 1
+        while end < len(masked) and depth:
+            if masked[end] == "[":
+                depth += 1
+            elif masked[end] == "]":
+                depth -= 1
+            end += 1
+        if depth:
+            continue
+
+        array_source = source[start:end]
+        array_mask = javascript_code_mask(array_source)
+        key_pattern = re.compile(
+            r"([,{]\s*)([A-Za-z_$][\w$]*)(\s*:)",
+        )
+        key_matches = [
+            key_match
+            for key_match in key_pattern.finditer(array_source)
+            if array_mask[key_match.end() - 1] == ":"
+        ]
+        for key_match in reversed(key_matches):
+            key_start, key_end = key_match.span(2)
+            array_source = (
+                array_source[:key_start]
+                + json.dumps(key_match.group(2))
+                + array_source[key_end:]
+            )
+        normalized = JS_STRING.sub(
+            lambda string_match: json.dumps(
+                next(
+                    decode_js_string(string_match.group(index), quote)
+                    for index, quote in enumerate(('"', "'", "`"), start=1)
+                    if string_match.group(index) is not None
+                )
+            ),
+            array_source,
+        )
+        normalized = re.sub(r",\s*([\]}])", r"\1", normalized)
+        try:
+            value = json.loads(normalized)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list):
+            bindings[match.group(1)] = value
+    return bindings
+
+
+def javascript_property_strings(
+    source: str,
+    masked: str,
+    key: str,
+    bindings: dict[str, str],
+) -> list[tuple[int, str]]:
+    values = []
+    property_pattern = re.compile(
+        rf"(?<![\w$])(?:{re.escape(key)}|\"{re.escape(key)}\"|"
+        rf"'{re.escape(key)}')\s*:\s*"
+    )
+    for match in property_pattern.finditer(source):
+        colon = source.rfind(":", match.start(), match.end())
+        if colon < 0 or masked[colon] != ":":
+            continue
+        value_start = match.end()
+        parsed = javascript_string_at(source, value_start)
+        if parsed is not None:
+            values.append((match.start(), parsed[0]))
+            continue
+        identifier_start = value_start
+        while (
+            identifier_start < len(masked) and masked[identifier_start].isspace()
+        ):
+            identifier_start += 1
+        identifier = re.match(r"[A-Za-z_$][\w$]*", masked[identifier_start:])
+        if identifier and identifier.group(0) in bindings:
+            values.append((match.start(), bindings[identifier.group(0)]))
+
+    if values or key not in bindings:
+        return values
+    shorthand = re.compile(rf"(?:^|[{{,])\s*{re.escape(key)}\s*(?=[,}}])")
+    if shorthand.search(masked):
+        values.append((0, bindings[key]))
+    return values
+
+
+def javascript_property_identifiers(
+    source: str,
+    masked: str,
+    key: str,
+) -> list[str]:
+    identifiers = []
+    property_pattern = re.compile(
+        rf"(?<![\w$])(?:{re.escape(key)}|\"{re.escape(key)}\"|"
+        rf"'{re.escape(key)}')\s*:\s*"
+    )
+    for match in property_pattern.finditer(source):
+        colon = source.rfind(":", match.start(), match.end())
+        if colon < 0 or masked[colon] != ":":
+            continue
+        value_start = match.end()
+        while value_start < len(masked) and masked[value_start].isspace():
+            value_start += 1
+        identifier = re.match(r"[A-Za-z_$][\w$]*", masked[value_start:])
+        if identifier:
+            identifiers.append(identifier.group(0))
+    if identifiers:
+        return identifiers
+    shorthand = re.compile(rf"(?:^|[{{,])\s*{re.escape(key)}\s*(?=[,}}])")
+    if shorthand.search(masked):
+        identifiers.append(key)
+    return identifiers
+
+
+def javascript_mapped_commands(
+    source: str,
+    masked: str,
+    command_identifier: str,
+    array_bindings: dict[str, list[Any]],
+) -> list[str] | None:
+    map_pattern = re.compile(
+        r"\b([A-Za-z_$][\w$]*)\s*\.map\s*\(\s*(?:async\s*)?\(?\s*"
+        r"(\[[^\]]+\]|[A-Za-z_$][\w$]*(?:\s*,\s*[A-Za-z_$][\w$]*)*)"
+        r"\s*\)?\s*=>"
+    )
+    matches = []
+    for match in map_pattern.finditer(masked):
+        values = array_bindings.get(match.group(1))
+        if values is None:
+            continue
+        parameter = match.group(2).strip()
+        if parameter.startswith("["):
+            parameters = [part.strip() for part in parameter[1:-1].split(",")]
+            if command_identifier not in parameters:
+                continue
+            command_index = parameters.index(command_identifier)
+            commands = []
+            for value in values:
+                if (
+                    not isinstance(value, list)
+                    or command_index >= len(value)
+                    or not isinstance(value[command_index], str)
+                ):
+                    break
+                commands.append(value[command_index])
+            else:
+                matches.append(commands)
+        elif parameter.split(",")[0].strip() == command_identifier and all(
+            isinstance(value, str) for value in values
+        ):
+            matches.append(values)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def javascript_mapped_configs(
+    source: str,
+    masked: str,
+    arguments: str,
+    tool_name: str,
+    array_bindings: dict[str, list[Any]],
+) -> list[tuple[str, str | None]] | None:
+    parameter = javascript_code_mask(arguments).strip()
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", parameter) is None:
+        return None
+    map_pattern = re.compile(
+        rf"\b([A-Za-z_$][\w$]*)\s*\.map\s*\(\s*(?:async\s*)?\(?\s*"
+        rf"{re.escape(parameter)}\s*\)?\s*=>"
+    )
+    matches = []
+    for match in map_pattern.finditer(masked):
+        values = array_bindings.get(match.group(1))
+        if values is None or not all(isinstance(value, dict) for value in values):
+            continue
+        configs = []
+        for value in values:
+            key = "chars" if tool_name == "write_stdin" else "cmd"
+            command = value.get(key)
+            if tool_name == "exec_command" and command is None:
+                command = value.get("command")
+            cwd = value.get("workdir")
+            if not isinstance(command, str) or not (
+                cwd is None or isinstance(cwd, str)
+            ):
+                break
+            if tool_name == "write_stdin" and cwd is None:
+                cwd = UNKNOWN_STDIN_CWD
+            configs.append((command, cwd))
+        else:
+            matches.append(configs)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def javascript_tool_calls(source: str) -> tuple[list[tuple[str, str]], bool]:
+    masked = javascript_code_mask(source)
+    call_pattern = re.compile(r"\btools\.(exec_command|write_stdin)\s*\(")
+    reference_pattern = re.compile(r"\btools\.(?:exec_command|write_stdin)\b")
+    calls = []
+    complete = True
+    for match in call_pattern.finditer(masked):
+        argument_start = match.end()
+        depth = 1
+        index = argument_start
+        while index < len(masked) and depth:
+            if masked[index] == "(":
+                depth += 1
+            elif masked[index] == ")":
+                depth -= 1
+            index += 1
+        if depth:
+            complete = False
+            argument_end = len(source)
+        else:
+            argument_end = index - 1
+        calls.append((match.group(1), source[argument_start:argument_end]))
+    if len(reference_pattern.findall(masked)) != len(calls):
+        complete = False
+    return calls, complete
+
+
+def commands_from_javascript(source: str) -> tuple[list[tuple[str, str | None]], bool]:
+    masked_source = javascript_code_mask(source)
+    bindings = javascript_bindings(source, masked_source)
+    array_bindings = javascript_array_bindings(source, masked_source)
+    calls, complete = javascript_tool_calls(source)
+    commands = []
+    fallback_workdirs = set()
+    for tool_name, arguments in calls:
+        mapped_configs = javascript_mapped_configs(
+            source,
+            masked_source,
+            arguments,
+            tool_name,
+            array_bindings,
+        )
+        if mapped_configs is not None:
+            commands.extend(mapped_configs)
+            fallback_workdirs.update(
+                cwd for _, cwd in mapped_configs if cwd is not None
+            )
+            continue
+        masked_arguments = javascript_code_mask(arguments)
+        key = "chars" if tool_name == "write_stdin" else "cmd"
+        values = javascript_property_strings(
+            arguments,
+            masked_arguments,
+            key,
+            bindings,
+        )
+        if tool_name == "exec_command":
+            values += javascript_property_strings(
+                arguments,
+                masked_arguments,
+                "command",
+                bindings,
+            )
+        workdirs = javascript_property_strings(
+            arguments,
+            masked_arguments,
+            "workdir",
+            bindings,
+        )
+        fallback_workdirs.update(value for _, value in workdirs)
+        command_values = [value for _, value in values]
+        if not command_values:
+            identifiers = javascript_property_identifiers(
+                arguments,
+                masked_arguments,
+                key,
+            )
+            if tool_name == "exec_command":
+                identifiers += javascript_property_identifiers(
+                    arguments,
+                    masked_arguments,
+                    "command",
+                )
+            if len(identifiers) == 1:
+                mapped = javascript_mapped_commands(
+                    source,
+                    masked_source,
+                    identifiers[0],
+                    array_bindings,
+                )
+                if mapped is not None:
+                    command_values = mapped
+        if not command_values or len(workdirs) > 1:
+            complete = False
+            continue
+        if workdirs:
+            cwd = workdirs[0][1]
+        elif tool_name == "write_stdin":
+            cwd = UNKNOWN_STDIN_CWD
+        else:
+            cwd = None
+        commands.extend((value, cwd) for value in command_values)
+
+    if complete:
+        return commands, True
+
+    parsed_commands = {command for command, _ in commands}
+    fallback_cwd = (
+        next(iter(fallback_workdirs)) if len(fallback_workdirs) == 1 else None
+    )
+    for value in javascript_strings(source):
+        if value not in parsed_commands and "*** Begin Patch" not in value:
+            commands.append((value, fallback_cwd))
+    return commands, False
+
+
 def has_file_redirection(command: str) -> bool:
     quote: str | None = None
     escaped = False
@@ -244,7 +750,7 @@ def has_file_redirection(command: str) -> bool:
             quote = char
             index += 1
             continue
-        if char != ">" or (index and command[index - 1] in "<=>-"):
+        if char != ">" or (index and command[index - 1] in "=>-"):
             index += 1
             continue
         if index + 1 < len(command) and command[index + 1] == "=":
@@ -334,13 +840,15 @@ def normalize_command(value: object) -> list[str]:
     if isinstance(value, str):
         return [value]
     if isinstance(value, list) and all(isinstance(part, str) for part in value):
-        return [" ".join(value)]
+        return [shlex.join(value)]
     return []
 
 
-def commands_from_call(payload: dict[str, Any]) -> list[tuple[str, str | None]]:
+def commands_from_call(
+    payload: dict[str, Any],
+) -> tuple[list[tuple[str, str | None]], bool]:
     if payload.get("type") not in ("function_call", "custom_tool_call"):
-        return []
+        return [], True
 
     name = payload.get("name")
     raw = payload.get("arguments")
@@ -348,93 +856,323 @@ def commands_from_call(payload: dict[str, Any]) -> list[tuple[str, str | None]]:
         raw = payload.get("input")
 
     decoded: object = raw
+    decode_failed = False
     if isinstance(raw, str) and raw.lstrip().startswith("{"):
         try:
             decoded = json.loads(raw)
         except json.JSONDecodeError:
             decoded = raw
+            decode_failed = True
 
-    if isinstance(decoded, dict):
+    if name in ("exec_command", "shell", "write_stdin") and isinstance(decoded, dict):
         commands = normalize_command(decoded.get("cmd"))
         commands += normalize_command(decoded.get("command"))
         if name == "write_stdin":
             commands += normalize_command(decoded.get("chars"))
         cwd = decoded.get("workdir")
         cwd = cwd if isinstance(cwd, str) else None
-        return [(command, cwd) for command in commands]
+        if name == "write_stdin" and cwd is None:
+            cwd = UNKNOWN_STDIN_CWD
+        complete = bool(commands) or name == "write_stdin"
+        return [(command, cwd) for command in commands], complete
 
-    if not isinstance(raw, str):
-        return []
-    if name in ("exec_command", "shell"):
-        return [(raw, None)]
     if name in ("exec", "functions.exec"):
-        if re.search(r"\btools\.(?:exec_command|write_stdin)\s*\(", raw):
-            return [
-                (value, None)
-                for value in javascript_strings(raw)
-                if "*** Begin Patch" not in value
-            ]
-        if "apply_patch" not in raw:
-            return [(raw, None)]
-    return []
+        if not isinstance(raw, str):
+            return [], False
+        return commands_from_javascript(raw)
+
+    if name not in ("exec_command", "shell"):
+        return [], True
+    if not isinstance(raw, str):
+        return [], False
+    return [(raw, None)], not decode_failed
 
 
-def collect(
-    rollout: Rollout,
-) -> tuple[list[PatchEvent], list[WriteCommand], bool]:
-    patches = []
-    writes = []
+def patch_payload_problems(payload: dict[str, Any]) -> list[str]:
+    problems = []
+    success = payload.get("success")
+    if not isinstance(success, bool):
+        problems.append("success 不是布尔值")
+
+    changes = payload.get("changes")
+    if not isinstance(changes, dict):
+        problems.append("changes 不是对象")
+        return problems
+    if success is True and not changes:
+        problems.append("成功补丁的 changes 为空")
+    for path, change in changes.items():
+        if not isinstance(path, str) or not os.path.isabs(path):
+            problems.append(f"变更路径不是绝对路径: {path!r}")
+        if not isinstance(change, dict):
+            problems.append(f"{path!r} 的变更记录不是对象")
+            continue
+        change_type = change.get("type")
+        if change_type not in ("add", "update", "delete"):
+            problems.append(f"{path!r} 的变更类型无效: {change_type!r}")
+        for field in ("content", "unified_diff"):
+            if field in change and not isinstance(change[field], str):
+                problems.append(f"{path!r} 的 {field} 不是字符串")
+        if "move_path" in change and change["move_path"] is not None:
+            move_path = change["move_path"]
+            if not isinstance(move_path, str) or not os.path.isabs(move_path):
+                problems.append(f"{path!r} 的 move_path 不是绝对路径")
+    return problems
+
+
+def resolve_command_cwd(cwd: str | None, rollout: Rollout) -> tuple[str, bool]:
+    if cwd == UNKNOWN_STDIN_CWD:
+        return cwd, False
+    if cwd is None:
+        return f"{rollout.cwd}（会话目录回退）", False
+    if not cwd:
+        return "未知（workdir 为空）", True
+    if os.path.isabs(cwd):
+        return os.path.normpath(cwd), False
+    if os.path.isabs(rollout.cwd):
+        return os.path.normpath(os.path.join(rollout.cwd, cwd)), False
+    return f"{cwd}（相对目录，基准未知）", True
+
+
+def collect(rollout: Rollout) -> tuple[list[PatchEvent | WriteCommand], bool]:
+    events: list[PatchEvent | WriteCommand] = []
     incomplete = False
+    direct_patch_calls: dict[str, int] = {}
+    patch_end_ids = []
+    nested_patch_calls = 0
     try:
         fp = open(rollout.path, encoding="utf-8")
     except OSError as exc:
         warn(f"无法读取 rollout {rollout.path}: {exc}")
-        return patches, writes, True
+        return events, True
 
     with fp:
-        for line_number, line in enumerate(fp, start=1):
-            if RELEVANT_PAYLOAD.search(line) is None:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError as exc:
-                warn(f"JSON 无效，已跳过 {rollout.path}:{line_number}: {exc}")
-                incomplete = True
-                continue
-            if not isinstance(data, dict):
-                warn(f"记录不是 JSON 对象，已跳过 {rollout.path}:{line_number}")
-                incomplete = True
-                continue
-            payload = data.get("payload") or {}
-            if not isinstance(payload, dict):
-                warn(f"payload 不是 JSON 对象，已跳过 {rollout.path}:{line_number}")
-                incomplete = True
-                continue
-            timestamp = data.get("timestamp") if isinstance(data.get("timestamp"), str) else "?"
-            sort_time = parse_time(timestamp, rollout.sort_time)
-            if payload.get("type") == "patch_apply_end":
-                patches.append(
-                    PatchEvent(timestamp, sort_time, line_number, rollout, payload)
-                )
-            for command, cwd in commands_from_call(payload):
-                for command_line in command.splitlines():
-                    command_line = command_line.strip()
-                    if command_line and looks_like_write(command_line):
-                        writes.append(
+        try:
+            for line_number, line in enumerate(fp, start=1):
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    warn(f"JSON 无效，已跳过 {rollout.path}:{line_number}: {exc}")
+                    incomplete = True
+                    continue
+                if not isinstance(data, dict):
+                    warn(f"记录不是 JSON 对象，已跳过 {rollout.path}:{line_number}")
+                    incomplete = True
+                    continue
+                payload = data.get("payload")
+                if not isinstance(payload, dict):
+                    warn(f"payload 不是 JSON 对象，已跳过 {rollout.path}:{line_number}")
+                    incomplete = True
+                    continue
+
+                payload_type = payload.get("type")
+                name = payload.get("name")
+                call_id = payload.get("call_id")
+                if payload_type == "custom_tool_call" and name == "apply_patch":
+                    if isinstance(call_id, str) and call_id:
+                        direct_patch_calls[call_id] = line_number
+                    else:
+                        warn(
+                            f"apply_patch 调用没有 call_id，无法确认是否落盘: "
+                            f"{rollout.path}:{line_number}"
+                        )
+                        incomplete = True
+                if payload_type == "custom_tool_call" and name in (
+                    "exec",
+                    "functions.exec",
+                ):
+                    raw = payload.get("arguments")
+                    if raw is None:
+                        raw = payload.get("input")
+                    if isinstance(raw, str):
+                        masked = javascript_code_mask(raw)
+                        nested_patch_calls += len(
+                            re.findall(r"\btools\.apply_patch\s*\(", masked)
+                        )
+                if payload_type == "patch_apply_end":
+                    patch_end_ids.append(call_id if isinstance(call_id, str) else None)
+
+                commands, command_complete = commands_from_call(payload)
+                relevant = payload_type == "patch_apply_end" or bool(commands)
+                relevant = relevant or not command_complete
+                if not relevant:
+                    continue
+
+                raw_timestamp = data.get("timestamp")
+                timestamp = raw_timestamp if isinstance(raw_timestamp, str) else "?"
+                sort_time = parsed_time(timestamp)
+                if sort_time is None:
+                    warn(
+                        f"相关记录时间戳无效，顺序可能不可靠: "
+                        f"{rollout.path}:{line_number}"
+                    )
+                    incomplete = True
+                    sort_time = rollout.sort_time
+
+                if payload_type == "patch_apply_end":
+                    problems = patch_payload_problems(payload)
+                    for problem in problems:
+                        warn(f"补丁记录不完整 {rollout.path}:{line_number}: {problem}")
+                    incomplete = incomplete or bool(problems)
+                    events.append(
+                        PatchEvent(timestamp, sort_time, line_number, rollout, payload)
+                    )
+                if not command_complete:
+                    warn(
+                        f"无法完整解析 shell 工具调用，候选命令可能有遗漏或误报: "
+                        f"{rollout.path}:{line_number}"
+                    )
+                    mark_uncertain()
+                for command, cwd in commands:
+                    command = command.strip()
+                    likely_write = bool(command) and looks_like_write(command)
+                    if command and (command_complete or likely_write):
+                        resolved_cwd, cwd_incomplete = resolve_command_cwd(cwd, rollout)
+                        if cwd_incomplete:
+                            warn(
+                                f"shell 工具调用的工作目录无法确定: "
+                                f"{rollout.path}:{line_number}"
+                            )
+                            mark_uncertain()
+                        events.append(
                             WriteCommand(
                                 timestamp,
                                 sort_time,
                                 line_number,
                                 rollout,
-                                command_line,
-                                cwd or f"{rollout.cwd}（会话目录回退）",
+                                command,
+                                resolved_cwd,
+                                likely_write,
                             )
                         )
-    return patches, writes, incomplete
+        except (OSError, UnicodeError) as exc:
+            warn(f"读取 rollout 中断 {rollout.path}: {exc}")
+            incomplete = True
+
+    matched_direct_ids = set(patch_end_ids) & set(direct_patch_calls)
+    for call_id in sorted(set(direct_patch_calls) - matched_direct_ids):
+        warn(
+            f"apply_patch 调用没有对应 patch_apply_end，是否落盘未知: "
+            f"{rollout.path}:{direct_patch_calls[call_id]} ({call_id})"
+        )
+        incomplete = True
+    unmatched_end_count = sum(
+        call_id not in matched_direct_ids for call_id in patch_end_ids
+    )
+    if nested_patch_calls > unmatched_end_count:
+        missing_count = nested_patch_calls - unmatched_end_count
+        warn(
+            f"functions.exec 中有 {missing_count} 个 apply_patch "
+            f"调用没有对应 patch_apply_end，是否落盘未知: {rollout.path}"
+        )
+        incomplete = True
+    return events, incomplete
 
 
-def event_key(event: PatchEvent | WriteCommand) -> tuple[float, str, int]:
-    return event.sort_time, event.rollout.thread_id, event.line_number
+def event_key(event: PatchEvent | WriteCommand) -> tuple[float, str, str, int]:
+    return (
+        event.sort_time,
+        event.rollout.thread_id,
+        event.rollout.path,
+        event.line_number,
+    )
+
+
+def merge_event_streams(
+    streams: Sequence[Sequence[PatchEvent | WriteCommand]],
+) -> list[PatchEvent | WriteCommand]:
+    """Merge rollout streams by time without reordering lines within one file."""
+    heap = []
+    for stream_index, stream in enumerate(streams):
+        if stream:
+            heapq.heappush(heap, (*event_key(stream[0]), stream_index, 0))
+
+    merged = []
+    while heap:
+        *_, stream_index, event_index = heapq.heappop(heap)
+        event = streams[stream_index][event_index]
+        merged.append(event)
+        next_index = event_index + 1
+        if next_index < len(streams[stream_index]):
+            next_event = streams[stream_index][next_index]
+            heapq.heappush(
+                heap,
+                (*event_key(next_event), stream_index, next_index),
+            )
+    return merged
+
+
+def print_patch(event: PatchEvent, root_id: str) -> None:
+    success = event.payload.get("success")
+    if success is True:
+        mark = "OK"
+    elif success is False:
+        mark = "!! 应用失败，未落盘"
+    else:
+        mark = "?? success 状态缺失"
+    role = "所选线程" if event.rollout.thread_id == root_id else "后代线程"
+    print(
+        f"--- 补丁 [{mark}] {event.timestamp}  "
+        f"({role} {event.rollout.thread_id})"
+    )
+
+    changes = event.payload.get("changes")
+    if not isinstance(changes, dict) or not changes:
+        print("(无 changes 记录)")
+        print()
+        return
+    for path, change in changes.items():
+        if not isinstance(change, dict):
+            print(f"? {path}: {change!r}")
+            continue
+        change_type = change.get("type", "?")
+        if change_type == "add":
+            content = change.get("content")
+            if not isinstance(content, str):
+                print(f"A {path}")
+                print("(无 content 记录)")
+                continue
+            lines = content.splitlines()
+            print(f"A {path}  (+{len(lines)} 行)")
+            for line in lines:
+                print(f"+{line}")
+            if content and not content.endswith("\n"):
+                print("\\ No newline at end of file")
+        elif change_type == "update":
+            move_path = change.get("move_path")
+            suffix = f"  -> {move_path} (改名)" if isinstance(move_path, str) else ""
+            print(f"M {path}{suffix}")
+            unified_diff = change.get("unified_diff")
+            if isinstance(unified_diff, str) and unified_diff:
+                print(unified_diff, end="" if unified_diff.endswith("\n") else "\n")
+            else:
+                print("(无 unified_diff 记录)")
+        elif change_type == "delete":
+            print(f"D {path}")
+            content = change.get("content")
+            if isinstance(content, str):
+                for line in content.splitlines():
+                    print(f"-{line}")
+                if content and not content.endswith("\n"):
+                    print("\\ No newline at end of file")
+            else:
+                print("(无 content 记录)")
+        else:
+            detail = json.dumps(change, ensure_ascii=False)[:500]
+            print(f"? {path}: {detail}")
+    print()
+
+
+def print_write(event: WriteCommand, root_id: str) -> None:
+    role = "所选线程" if event.rollout.thread_id == root_id else "后代线程"
+    mark = "疑似写入" if event.likely_write else "保守列出"
+    print(
+        f"--- shell [{mark}] {event.timestamp}  "
+        f"({role} {event.rollout.thread_id})"
+    )
+    print(f"目录: {event.cwd}")
+    for line_number, line in enumerate(event.command.splitlines()):
+        print(f"$ {line}" if line_number == 0 else f"  {line}")
+    print()
 
 
 def count_diff_lines(unified_diff: object) -> tuple[int, int]:
@@ -466,10 +1204,11 @@ def summarize(patches: Sequence[PatchEvent]) -> tuple[dict[str, dict[str, Any]],
             if not isinstance(change, dict):
                 continue
             entry = files.setdefault(
-                path, {"plus": 0, "minus": 0, "last": "?", "moved_to": None}
+                path, {"plus": 0, "minus": 0, "last": "?", "moved_to": None, "types": set()}
             )
             change_type = change.get("type", "?")
             entry["last"] = change_type
+            entry["types"].add(change_type)
             if change_type == "add":
                 content = change.get("content")
                 entry["plus"] += len(content.splitlines()) if isinstance(content, str) else 0
@@ -482,7 +1221,6 @@ def summarize(patches: Sequence[PatchEvent]) -> tuple[dict[str, dict[str, Any]],
                 entry["minus"] += minus
                 if isinstance(change.get("move_path"), str):
                     entry["moved_to"] = change["move_path"]
-            entry.setdefault("types", set()).add(change_type)
     return files, failed
 
 
@@ -495,75 +1233,12 @@ def print_summary(files: dict[str, dict[str, Any]], failed: int) -> None:
     for path, entry in files.items():
         if entry["last"] == "delete":
             mark = "D"
-        elif "add" in entry.get("types", set()):
+        elif "add" in entry["types"]:
             mark = "A"
         else:
             mark = "M"
-        counts = []
-        if entry["plus"]:
-            counts.append(f"+{entry['plus']}")
-        if entry["minus"]:
-            counts.append(f"-{entry['minus']}")
-        suffix = f"  -> {entry['moved_to']} (改名)" if entry["moved_to"] else ""
-        print(f"  {mark} {path:<{width}}  {' '.join(counts) or '(无行变化)'}{suffix}")
-    print()
-
-
-def print_patch(event: PatchEvent, root_id: str) -> None:
-    success = event.payload.get("success")
-    if success is True:
-        mark = "OK"
-    elif success is False:
-        mark = "!! 应用失败，未落盘"
-    else:
-        mark = "?? success 状态缺失"
-    role = "主线程" if event.rollout.thread_id == root_id else "子线程"
-    print(
-        f"--- 补丁 [{mark}] {event.timestamp}  "
-        f"({role} {event.rollout.thread_id})"
-    )
-
-    changes = event.payload.get("changes")
-    if not isinstance(changes, dict) or not changes:
-        print("(无 changes 记录)")
-        print()
-        return
-    for path, change in changes.items():
-        if not isinstance(change, dict):
-            print(f"? {path}: {change!r}")
-            continue
-        change_type = change.get("type", "?")
-        if change_type == "add":
-            content = change.get("content")
-            if not isinstance(content, str):
-                print("(无 content 记录)")
-                continue
-            lines = content.splitlines()
-            print(f"A {path}  (+{len(lines)} 行)")
-            for line in lines:
-                print(f"+{line}")
-            if content and not content.endswith("\n"):
-                print("\\ No newline at end of file")
-        elif change_type == "update":
-            move_path = change.get("move_path")
-            suffix = f"  -> {move_path} (改名)" if isinstance(move_path, str) else ""
-            print(f"M {path}{suffix}")
-            unified_diff = change.get("unified_diff")
-            if isinstance(unified_diff, str) and unified_diff:
-                print(unified_diff, end="" if unified_diff.endswith("\n") else "\n")
-            else:
-                print("(无 unified_diff 记录)")
-        elif change_type == "delete":
-            print(f"D {path}")
-            content = change.get("content")
-            if isinstance(content, str):
-                for line in content.splitlines():
-                    print(f"-{line}")
-                if content and not content.endswith("\n"):
-                    print("\\ No newline at end of file")
-        else:
-            detail = json.dumps(change, ensure_ascii=False)[:500]
-            print(f"? {path}: {detail}")
+        moved = f"  -> {entry['moved_to']} (改名)" if entry["moved_to"] else ""
+        print(f"  {mark} {path:<{width}}  +{entry['plus']} -{entry['minus']}{moved}")
     print()
 
 
@@ -577,34 +1252,50 @@ def show(root: Rollout, rollouts: Sequence[Rollout]) -> bool:
     print(f"目录: {root.cwd}   时间: {root.timestamp or '?'}")
     print()
 
-    patches = []
-    writes = []
+    streams = []
     incomplete = False
     for rollout in family:
-        rollout_patches, rollout_writes, rollout_incomplete = collect(rollout)
-        patches.extend(rollout_patches)
-        writes.extend(rollout_writes)
+        rollout_events, rollout_incomplete = collect(rollout)
+        streams.append(rollout_events)
         incomplete = incomplete or rollout_incomplete
 
-    patches.sort(key=event_key)
-    writes.sort(key=event_key)
-    files, failed = summarize(patches)
-    if files or failed:
+    events = merge_event_streams(streams)
+    patches = [event for event in events if isinstance(event, PatchEvent)]
+    writes = [event for event in events if isinstance(event, WriteCommand)]
+    likely_writes = sum(event.likely_write for event in writes)
+    timestamp_paths: dict[float, set[str]] = {}
+    for event in events:
+        timestamp_paths.setdefault(event.sort_time, set()).add(event.rollout.path)
+    ambiguous_times = [
+        timestamp
+        for timestamp, paths in timestamp_paths.items()
+        if len(paths) > 1
+    ]
+    if ambiguous_times:
+        warn(
+            f"{len(ambiguous_times)} 个时间戳同时出现在不同线程日志中；"
+            "这些并列事件的先后顺序无法从日志确定"
+        )
+        mark_uncertain()
+
+    if patches:
+        files, failed = summarize(patches)
         print_summary(files, failed)
-    for patch in patches:
-        print_patch(patch, root.thread_id)
+
+    if events:
+        print(
+            f"=== 文件变更时间线: {len(patches)} 个补丁，"
+            f"{len(writes)} 条 shell 调用（{likely_writes} 条疑似写入） ==="
+        )
+        print()
+        for event in events:
+            if isinstance(event, PatchEvent):
+                print_patch(event, root.thread_id)
+            else:
+                print_write(event, root.thread_id)
     if not patches:
         print("=== 无补丁记录（未通过 apply_patch 改文件）===")
         print()
-
-    if writes:
-        print(f"=== 可能写文件的 shell 命令 ({len(writes)} 条，需自行判断) ===")
-        for write in writes:
-            role = "主线程" if write.rollout.thread_id == root.thread_id else "子线程"
-            print(
-                f"  [{write.timestamp}] [{role} {write.rollout.thread_id}]"
-                f" [目录 {write.cwd}]\n  $ {write.command}"
-            )
     return incomplete
 
 
@@ -620,7 +1311,10 @@ def positive_int(value: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="显示 Codex 会话及其所有子线程应用过的补丁。"
+        description="显示 Codex 会话及其所有子线程应用过的补丁。",
+        epilog="退出码: 0=完整; 1=shell 启发式有不确定处（常见，输出仍可用）; "
+               "2=日志损坏或补丁是否落盘不明（输出可能漏改动，需人工核对）。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("thread_id", nargs="?", help="完整线程 ID 或唯一 ID 前缀")
     parser.add_argument(
@@ -636,6 +1330,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if args.list is not None and args.thread_id:
         parser.error("不能同时指定 thread_id 和 --list")
     return args
+
+
+def exit_code(hard: bool) -> int:
+    """2 = 日志损坏/补丁落盘不明（必须处理）；1 = 仅启发式不确定；0 = 干净。"""
+    if hard:
+        return 2
+    return 1 if HEURISTIC_UNCERTAIN else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -655,7 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit("没有顶层会话记录")
         for rollout in roots[: args.list]:
             print(f"{rollout.timestamp or '?'}  {rollout.thread_id}  {rollout.cwd}")
-        return 1 if scan_incomplete else 0
+        return exit_code(scan_incomplete)
 
     if args.thread_id:
         root = resolve_rollout(rollouts, args.thread_id)
@@ -664,7 +1365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit("没有顶层会话记录")
         root = roots[0]
     family_incomplete = show(root, rollouts)
-    return 1 if scan_incomplete or family_incomplete else 0
+    return exit_code(scan_incomplete or family_incomplete)
 
 
 if __name__ == "__main__":
