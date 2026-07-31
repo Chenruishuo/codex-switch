@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p "$HOME/bin"
-cp bin/codex-switch bin/codex-mcp-keeper "$HOME/bin/"
-chmod +x "$HOME/bin/codex-switch" "$HOME/bin/codex-mcp-keeper"
+cp bin/codex-switch bin/codex-mcp-keeper bin/codex-diff "$HOME/bin/"
+chmod +x "$HOME/bin/codex-switch" "$HOME/bin/codex-mcp-keeper" "$HOME/bin/codex-diff"
 case ":$PATH:" in
   *":$HOME/bin:"*) ;;
   *)

@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""codex-diff — 事后查看某次 Codex 会话到底改了哪些文件、改了什么。
+
+用法:
+  codex-diff              # 最近一次会话
+  codex-diff <thread-id>  # 指定会话(MCP 返回的 threadId,或 rollout 文件名里的 id)
+  codex-diff -n 5         # 列出最近 5 次会话供挑选
+
+原理: Codex 把每次 apply_patch 的原始补丁、以及每条执行过的 shell 命令都写进
+~/.codex/sessions/**/rollout-*.jsonl。即使改文件前没打快照,这里也能还原改动。
+注意: 通过 shell 重定向/sed 等方式写文件不会产生 patch 记录,本工具会把可疑的
+写命令单独列出提醒(需自行判断)。
+"""
+import glob
+import json
+import os
+import re
+import sys
+
+HOME = os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex"))
+WRITE_HINT = re.compile(
+    r"\bsed\s+-i\b|\btee\b|\bdd\s+if=|\btruncate\b|\b(mv|cp|rm|mkdir|chmod|touch)\s|"
+    r"(?<![=\-<&\d])>>?\s*(?!/dev/null|&\d)[\w./$~'\"-]")  # 排除 =>、2>&1、>/dev/null
+
+
+def sessions():
+    fs = glob.glob(os.path.join(HOME, "sessions", "**", "rollout-*.jsonl"), recursive=True)
+    return sorted(fs, key=os.path.getmtime, reverse=True)
+
+
+def show(path):
+    meta, patches, writes = {}, [], []
+    for line in open(path):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        p = d.get("payload") or {}
+        if not meta and p.get("session_id"):
+            meta = p
+        inp = p.get("input") or ""
+        if p.get("type") == "custom_tool_call" and "apply_patch" in inp:
+            m = re.search(r'"(\*\*\* Begin Patch.*?\*\*\* End Patch)"', inp, re.S)
+            if m:
+                patches.append(m.group(1).encode().decode("unicode_escape"))
+        if p.get("type") in ("function_call", "custom_tool_call"):
+            args = p.get("arguments") or inp
+            cmd = None
+            if isinstance(args, str) and args.strip().startswith("{"):
+                try:
+                    c = json.loads(args).get("command")
+                    cmd = " ".join(x for x in c if isinstance(x, str)) if isinstance(c, list) else c
+                except ValueError:
+                    pass
+                if not isinstance(cmd, str):
+                    cmd = None
+            elif p.get("name") in ("shell", "exec") and "apply_patch" not in inp:
+                cmd = inp.strip()
+            if cmd:  # 逐行判断,避免整段脚本因一行命中而全量刷屏
+                for ln in cmd.splitlines():
+                    ln = ln.strip()
+                    if ln and WRITE_HINT.search(ln) and ln[:200] not in writes:
+                        writes.append(ln[:200])
+
+    print(f"会话: {os.path.basename(path)}")
+    print(f"目录: {meta.get('cwd', '?')}   时间: {meta.get('timestamp', '?')}")
+    print()
+    if patches:
+        print(f"=== apply_patch 改动 ({len(patches)} 处) ===")
+        for pt in patches:
+            print(pt)
+            print()
+    else:
+        print("=== 无 apply_patch 记录(未通过补丁方式改文件)===\n")
+    if writes:
+        print(f"=== 可能写文件的 shell 命令 ({len(writes)} 条,需自行判断)===")
+        for c in writes:
+            print(f"  $ {c}")
+
+
+def main():
+    a = sys.argv[1:]
+    if a and a[0] == "-n":
+        for f in sessions()[: int(a[1]) if len(a) > 1 else 10]:
+            m = re.search(r"rollout-(\S+?)-([0-9a-f-]{36})\.jsonl", os.path.basename(f))
+            print(f"{m.group(1) if m else '?'}  {m.group(2) if m else os.path.basename(f)}")
+        return
+    if a:
+        hits = [f for f in sessions() if a[0] in f]
+        if not hits:
+            sys.exit(f"找不到会话: {a[0]}")
+        show(hits[0])
+    else:
+        fs = sessions()
+        if not fs:
+            sys.exit("没有会话记录")
+        show(fs[0])
+
+
+if __name__ == "__main__":
+    main()

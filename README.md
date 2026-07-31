@@ -31,7 +31,19 @@ codex-switch official   # 切回官方订阅 (恢复备份的登录态;若无备
 codex-switch sync       # 只同步会话元数据到当前 provider,不切换
 ```
 
-机制细节见两个脚本的头部注释。keeper 日志: `~/.codex/mcp-keeper.log`。
+### codex-diff — 事后查看 Codex 改了什么
+
+```bash
+codex-diff              # 最近一次会话的改动
+codex-diff <threadId>   # 指定会话(MCP 返回的 threadId)
+codex-diff -n 5         # 列出最近 5 次会话
+```
+
+Codex 把每次 `apply_patch` 的原始补丁写进 `~/.codex/sessions/**/rollout-*.jsonl`,
+所以**即使改文件前没打快照**也能还原它改了哪些文件、改了什么。
+经 shell 重定向/sed 写入的改动不产生补丁记录,工具会把可疑写命令另行列出提醒。
+
+机制细节见各脚本的头部注释。keeper 日志: `~/.codex/mcp-keeper.log`。
 
 ## 安全说明
 
