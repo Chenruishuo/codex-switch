@@ -211,7 +211,7 @@ def scenario_summary_and_exit():
             "/tmp/work/d.py": {"type": "update", "unified_diff": "@@\n-1\n+2\n"}}, success=False),
     ])
     code, out, _ = run(home, T)
-    check("有摘要段", "=== 摘要:" in out)
+    check("有摘要段", "=== apply_patch 摘要:" in out)
     check("摘要计入 3 个文件", "3 个文件落盘" in out)
     check("摘要单列失败补丁", "1 个补丁应用失败" in out)
     check("摘要标 A/+行数", "A /tmp/work/a.py" in out and "+3" in out)

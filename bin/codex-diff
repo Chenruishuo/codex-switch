@@ -80,8 +80,7 @@ class WriteCommand:
 
 
 # 退出码分两级：日志损坏 / 补丁是否落盘不明属于「硬」问题，必须处理；
-# shell 启发式解析不确定属于「软」问题，在真实日志里约三分之一会话都会命中，
-# 混在一起会让非零退出码失去意义。
+# shell 静态解析或跨线程顺序不确定属于「软」问题；输出仍可用，但需要人工核对。
 HEURISTIC_UNCERTAIN = False
 
 
@@ -1189,13 +1188,19 @@ def count_diff_lines(unified_diff: object) -> tuple[int, int]:
     return plus, minus
 
 
-def summarize(patches: Sequence[PatchEvent]) -> tuple[dict[str, dict[str, Any]], int]:
+def summarize(
+    patches: Sequence[PatchEvent],
+) -> tuple[dict[str, dict[str, Any]], int, int]:
     """按文件汇总落盘结果。只统计成功的补丁，失败的单独计数。"""
     files: dict[str, dict[str, Any]] = {}
     failed = 0
+    uncertain = 0
     for event in patches:
-        if event.payload.get("success") is not True:
+        if event.payload.get("success") is False:
             failed += 1
+            continue
+        if event.payload.get("success") is not True:
+            uncertain += 1
             continue
         changes = event.payload.get("changes")
         if not isinstance(changes, dict):
@@ -1204,30 +1209,56 @@ def summarize(patches: Sequence[PatchEvent]) -> tuple[dict[str, dict[str, Any]],
             if not isinstance(change, dict):
                 continue
             entry = files.setdefault(
-                path, {"plus": 0, "minus": 0, "last": "?", "moved_to": None, "types": set()}
+                path,
+                {
+                    "plus": 0,
+                    "minus": 0,
+                    "plus_unknown": False,
+                    "minus_unknown": False,
+                    "last": "?",
+                    "moved_to": None,
+                    "types": set(),
+                },
             )
             change_type = change.get("type", "?")
             entry["last"] = change_type
             entry["types"].add(change_type)
             if change_type == "add":
                 content = change.get("content")
-                entry["plus"] += len(content.splitlines()) if isinstance(content, str) else 0
+                if isinstance(content, str):
+                    entry["plus"] += len(content.splitlines())
+                else:
+                    entry["plus_unknown"] = True
             elif change_type == "delete":
                 content = change.get("content")
-                entry["minus"] += len(content.splitlines()) if isinstance(content, str) else 0
+                if isinstance(content, str):
+                    entry["minus"] += len(content.splitlines())
+                else:
+                    entry["minus_unknown"] = True
             elif change_type == "update":
-                plus, minus = count_diff_lines(change.get("unified_diff"))
-                entry["plus"] += plus
-                entry["minus"] += minus
+                unified_diff = change.get("unified_diff")
+                if isinstance(unified_diff, str):
+                    plus, minus = count_diff_lines(unified_diff)
+                    entry["plus"] += plus
+                    entry["minus"] += minus
+                else:
+                    entry["plus_unknown"] = True
+                    entry["minus_unknown"] = True
                 if isinstance(change.get("move_path"), str):
                     entry["moved_to"] = change["move_path"]
-    return files, failed
+    return files, failed, uncertain
 
 
-def print_summary(files: dict[str, dict[str, Any]], failed: int) -> None:
-    head = f"=== 摘要: {len(files)} 个文件落盘"
+def print_summary(
+    files: dict[str, dict[str, Any]],
+    failed: int,
+    uncertain: int,
+) -> None:
+    head = f"=== apply_patch 摘要: {len(files)} 个文件落盘"
     if failed:
         head += f"，另有 {failed} 个补丁应用失败（未落盘）"
+    if uncertain:
+        head += f"，另有 {uncertain} 个补丁状态未知"
     print(head + " ===")
     width = max((len(path) for path in files), default=0)
     for path, entry in files.items():
@@ -1238,7 +1269,9 @@ def print_summary(files: dict[str, dict[str, Any]], failed: int) -> None:
         else:
             mark = "M"
         moved = f"  -> {entry['moved_to']} (改名)" if entry["moved_to"] else ""
-        print(f"  {mark} {path:<{width}}  +{entry['plus']} -{entry['minus']}{moved}")
+        plus = "?" if entry["plus_unknown"] else str(entry["plus"])
+        minus = "?" if entry["minus_unknown"] else str(entry["minus"])
+        print(f"  {mark} {path:<{width}}  +{plus} -{minus}{moved}")
     print()
 
 
@@ -1279,8 +1312,8 @@ def show(root: Rollout, rollouts: Sequence[Rollout]) -> bool:
         mark_uncertain()
 
     if patches:
-        files, failed = summarize(patches)
-        print_summary(files, failed)
+        files, failed, uncertain = summarize(patches)
+        print_summary(files, failed, uncertain)
 
     if events:
         print(
@@ -1312,7 +1345,7 @@ def positive_int(value: str) -> int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="显示 Codex 会话及其所有子线程应用过的补丁。",
-        epilog="退出码: 0=完整; 1=shell 启发式有不确定处（常见，输出仍可用）; "
+        epilog="退出码: 0=完整; 1=shell 解析或跨线程顺序不确定（输出仍可用）; "
                "2=日志损坏或补丁是否落盘不明（输出可能漏改动，需人工核对）。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1333,7 +1366,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def exit_code(hard: bool) -> int:
-    """2 = 日志损坏/补丁落盘不明（必须处理）；1 = 仅启发式不确定；0 = 干净。"""
+    """2 = 日志/落盘硬问题；1 = shell 或顺序不确定；0 = 完整。"""
     if hard:
         return 2
     return 1 if HEURISTIC_UNCERTAIN else 0
