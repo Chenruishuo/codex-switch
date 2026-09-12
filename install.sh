@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 安装 codex-switch + codex-mcp-keeper 到 ~/bin,并把 Claude Code 的 codex MCP 注册指向 keeper
+# 安装 codex-switch + codex-mcp-keeper + codex-diff 到 ~/bin。
+# codex ≤0.153: 把 Claude Code 的 codex MCP 注册指向 keeper(包装 `codex mcp-server`)。
+# codex ≥0.154: `codex mcp-server` 已移除,MCP 请注册 ARIS 的 codex-exec 桥(见 README),本脚本不改注册。
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p "$HOME/bin"
@@ -15,7 +17,10 @@ case ":$PATH:" in
     echo "已把 ~/bin 加入 PATH ($rc);重开终端或 source $rc 后生效"
     ;;
 esac
-if command -v claude >/dev/null 2>&1; then
+if ! codex mcp-server --help >/dev/null 2>&1; then
+  echo "本机 codex 已无 'codex mcp-server'(≥0.154),不注册 keeper;请把 codex MCP 指向 ARIS 的 codex-exec 桥:"
+  echo "  claude mcp add codex -s user -- python3 /abs/path/to/aris_repo/mcp-servers/codex-exec/server.py"
+elif command -v claude >/dev/null 2>&1; then
   claude mcp remove codex -s user >/dev/null 2>&1 || true
   claude mcp add-json codex "{\"type\":\"stdio\",\"command\":\"python3\",\"args\":[\"$HOME/bin/codex-mcp-keeper\"]}" -s user
   echo "已把 Claude Code 的 codex MCP 注册指向 keeper (user scope)"

@@ -16,11 +16,12 @@
 # - 官方登录态在首次切 relay 时备份到 auth.official.json,切回时恢复。
 # - [model_providers.cctq] 配置块一次性写入 config.toml 后不再移除,
 #   切换只改根级 model_provider 一行 + auth.json。
-# - config.toml 每次工具调用都会重读,但 auth 是 codex mcp-server 进程级缓存,
-#   所以切换后要杀掉存量 mcp-server 进程(脚本自动做)。Claude Code 的 codex MCP
-#   注册指向 ~/bin/codex-mcp-keeper(守护包装器):它保持与 Claude Code 的管道,
-#   内层被杀后自动重拉并重放 MCP 握手,因此切换对运行中的会话无感,无需人工
-#   /mcp reconnect;TUI/exec 每次新进程,天然不受影响。
+# - config.toml 与 auth.json 每次 `codex exec` 进程启动时重读。codex-cli 0.154 起
+#   `codex mcp-server` 已被移除,Claude Code 的 codex MCP 注册改为 ARIS 的 codex-exec
+#   桥(mcp-servers/codex-exec/server.py):每次工具调用都是一个全新的 codex exec
+#   子进程,不存在进程级 auth 缓存,切换后无需重启任何东西,运行中的会话立即生效。
+# - 兼容旧版(codex ≤0.153,注册指向 ~/bin/codex-mcp-keeper 包装 `codex mcp-server`,
+#   auth 为进程级缓存):切换后仍 pkill 存量 mcp-server,keeper 会自动重拉并重放握手。
 set -euo pipefail
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -147,10 +148,12 @@ if os.path.exists(gs):
 PY
 }
 
-restart_mcp() {  # 杀掉缓存旧 auth 的 mcp-server;codex-mcp-keeper 会自动重拉并保持连接
+restart_mcp() {  # 旧版兼容:杀掉缓存旧 auth 的 mcp-server(codex ≤0.153 + keeper);codex-exec 桥无需任何重启
   if pkill -f "codex mcp-server" 2>/dev/null; then
     echo "已终止存量 codex mcp-server 进程(auth 为进程级缓存);keeper 会自动重拉,MCP 连接无感存活"
     echo "(仅 keeper 注册之前启动的旧 Claude 会话需要手动 /mcp reconnect 一次)"
+  else
+    echo "MCP 走 codex-exec 桥(每次调用新起 codex exec,无 auth 缓存),下一次调用即生效,无需重启"
   fi
 }
 

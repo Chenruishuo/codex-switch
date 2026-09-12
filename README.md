@@ -7,9 +7,13 @@
 - 官方登录态自动备份/恢复(`~/.codex/auth.official.json`);
 - 历史会话不"消失"——自动同步 `state_*.sqlite` 与 `sessions/` rollout 的 provider 元数据
   (Codex 禁止覆写内置 provider id,中转必须用独立 id,否则 `/resume` 按 provider 过滤会看不到历史);
-- 切换对运行中的 Claude Code 会话无感——`codex-mcp-keeper` 作为 MCP 注册命令保持与
-  Claude Code 的 stdio 管道,内层 `codex mcp-server`(auth 为进程级缓存,切换后必须重启)
-  被杀后自动重拉并重放 MCP 握手,在途请求返回明确错误而非挂死。
+- 切换对运行中的 Claude Code 会话无感:
+  - **codex ≥0.154**(`codex mcp-server` 已被移除):codex MCP 注册指向 ARIS 的
+    `mcp-servers/codex-exec/server.py` 桥,每次工具调用新起一个 `codex exec` 子进程,
+    auth/config 每次重读,切换后下一次调用即生效,不需要重启任何东西;
+  - **codex ≤0.153**:`codex-mcp-keeper` 作为 MCP 注册命令保持与 Claude Code 的 stdio 管道,
+    内层 `codex mcp-server`(auth 为进程级缓存,切换后必须重启)被杀后自动重拉并重放
+    MCP 握手,在途请求返回明确错误而非挂死。
 
 ## 安装
 
@@ -21,6 +25,7 @@ printf '%s' 'sk-你的token' > ~/.codex/cctq.key && chmod 600 ~/.codex/cctq.key
 
 依赖: bash、python3 (≥3.6)、sqlite3 CLI、codex CLI;可选 claude CLI(用于自动注册 MCP)。
 Linux / macOS 通用(keeper 会自动定位各平台的 codex 原生二进制,找不到则退回 PATH 上的 codex)。
+codex ≥0.154 时 install.sh 不再注册 keeper,请按上文把 MCP 指向 ARIS codex-exec 桥。
 
 ## 使用
 
